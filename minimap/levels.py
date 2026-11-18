@@ -85,6 +85,9 @@ class Detector:
         smp = self.samples[-8:]
         if self.level and self.score(self.level, smp) < 2.5:
             return self.level
+        if hint in self.info and self.score(hint, smp) < 1.0:
+            self.level = hint                    # the save's current region fits: no need to wait for movement
+            return self.level
         order = sorted(self.info, key=lambda lv: (lv != hint, lv))
         scores = sorted((self.score(lv, smp), lv) for lv in order)
         best, lv = scores[0]
@@ -132,7 +135,7 @@ def ui_string(key):
 
 def markers(level):
     """[{id, icon, name, x, z}] from [scene]/data_for_ssl.bin (cached as JSON)."""
-    cache = os.path.join(MAPS, level + ".markers.json")
+    cache = os.path.join(MAPS, level + ".markers2.json")
     if os.path.exists(cache):
         try:
             return json.load(open(cache, encoding="utf-8"))
@@ -155,9 +158,34 @@ def markers(level):
             if ident in seen or not (abs(x) < 3000 and abs(zz) < 3000):
                 continue
             seen.add(ident)
-            out.append({"id": ident, "icon": icon, "name": ui_string(key) or ui_string(ident + "_NAME") or "",
+            out.append({"id": ident, "icon": icon, "key": key, "name": ui_string(key) or ui_string(ident + "_NAME") or "",
                         "x": float(x), "z": float(zz)})
         json.dump(out, open(cache, "w", encoding="utf-8"), indent=0)
     except Exception:
         pass
     return out
+
+
+def progress(save):
+    """Set of marker ids / name keys the player has completed (tasks, contracts, upgrades, watchtowers)."""
+    done = set()
+    try:
+        done.update(save.get("finishedObjs", []) or [])
+        for lv, d in (save.get("upgradesGiverData") or {}).items():
+            done.update(k for k, v in d.items() if v == 2)
+        for lv, d in ((save.get("watchPointsData") or {}).get("data") or {}).items():
+            done.update(k for k, v in d.items() if v)
+    except Exception:
+        pass
+    return done
+
+
+def is_done(marker, done):
+    k, i = marker.get("key", ""), marker["id"]
+    if i in done or k in done:
+        return True
+    # contracts / tasks list their parent objective (e.g. ..._BRIDGE_TASK) in finishedObjs
+    for suf in ("_NAME", "_DELIVERY_TASK", "_TASK", "_CONTRACT"):
+        if k.endswith(suf) and (k[: -len(suf)] + "_CONTRACT" in done or k[: -len(suf)] + "_TASK" in done):
+            return True
+    return False

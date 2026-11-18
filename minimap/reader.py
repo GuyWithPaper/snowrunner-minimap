@@ -35,8 +35,8 @@ class TruckState:
     def __init__(self, pos, fwd, t):
         self.x, self.y, self.z = map(float, pos)
         self.fx, self.fz = float(fwd[0]), float(fwd[2])
-        # heading: angle of forward vector on the map, 0 = north (-z), clockwise positive
-        self.heading = float(np.degrees(np.arctan2(self.fx, -self.fz)))
+        # heading: angle of forward vector on the map, 0 = north (+z, as on the in-game map), clockwise positive
+        self.heading = float(np.degrees(np.arctan2(self.fx, self.fz)))
         self.t = t
 
 

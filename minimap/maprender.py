@@ -32,8 +32,24 @@ def pct_info(z, name):
     return w, hgt, h[0x26]
 
 
+def pct_payload(d):
+    """Pixel data of a Swarm .pct: after the mip table, before the 6-byte footer (01 00 + u32 size).
+    Layout per github.com/skibidius/SnowrunnerMapConverter (parse_pct)."""
+    try:
+        table_end = struct.unpack_from("<Q", d, 0x36)[0]
+        marker = struct.unpack_from("<H", d, table_end)[0]
+        term = struct.unpack_from("<Q", d, table_end + 2)[0] if marker == 0x0104 else table_end
+        start = term + 6
+        if 0 < start < len(d) - 6:
+            return d[start:len(d) - 6]
+    except struct.error:
+        pass
+    return d[88:len(d) - 6]
+
+
 def tail(z, name, nbytes):
-    return z.read(name)[-nbytes:]
+    """First nbytes of the top mip (name kept for history)."""
+    return pct_payload(z.read(name))[:nbytes]
 
 
 def dds_wrap(fourcc, data, w, h, dx10=None):
@@ -191,6 +207,117 @@ def stg_plants(d, ntypes, half_x, half_z):
     return a[np.sort(u)]
 
 
+# ---------------------------------------------------------------- the game's baked map tiles
+def baked_tiles(stg, W, H):
+    """The game's own baked top-down terrain colour: one 64x64 DXT5 tile per 2x2 terrain blocks (48 m),
+    row-major from the top-left, stored as length-prefixed records from data.stg section offset [2].
+    RGB = colour (roads, painted ground, water, relief), A = occlusion of trees and buildings.
+    Returns uint8 (h, w, 4) at 0.75 m per pixel, or None."""
+    try:
+        nx, nz = (W - 1) // 96, (H - 1) // 96
+        if nx < 1 or nz < 1:
+            return None
+        p = struct.unpack_from("<4I", stg, 0)[2]
+        img = np.zeros((nz * 64, nx * 64, 4), np.uint8)
+        n = 0
+        while p + 4 < len(stg) and n < nx * nz:
+            L = struct.unpack_from("<I", stg, p)[0]
+            if L <= 0 or p + 4 + L > len(stg):
+                break
+            b0 = p + 4
+            p += 4 + L
+            if stg[b0 + 1:b0 + 5] != b"\x80\x10\x00\x00" or stg[b0 + 5:b0 + 9] != b"DDS ":
+                continue
+            body = stg[b0:b0 + L]
+            q, last = body.find(b"DDS |"), None
+            while q >= 0:
+                if body[q + 84:q + 88] == b"DXT5" and struct.unpack_from("<II", body, q + 12) == (64, 64):
+                    last = q
+                q = body.find(b"DDS |", q + 4)
+            if last is None:
+                continue
+            t = Image.open(io.BytesIO(body[last:last + 128 + 5504])).convert("RGBA")
+            r, c = divmod(n, nx)
+            img[r * 64:(r + 1) * 64, c * 64:(c + 1) * 64] = np.asarray(t)
+            n += 1
+        if n != nx * nz:
+            return None
+        return level_tile_seams(img, nx, nz)
+    except Exception:
+        return None
+
+
+def level_tile_seams(img, nx, nz, T=64):
+    """Remove brightness/colour steps between baked tiles without blurring their content: solve a per-tile
+    colour offset that best matches neighbours across every shared edge, then apply it as a smooth field."""
+    f = img[..., :3].astype(np.float32)
+    o = np.zeros((nz, nx, 3), np.float32)
+    # edge differences (median over the edge of the 1-pixel step), right and down neighbours
+    dr = np.zeros((nz, nx - 1, 3), np.float32); dd = np.zeros((nz - 1, nx, 3), np.float32)
+    for r in range(nz):
+        for c in range(nx - 1):
+            a = f[r * T:(r + 1) * T, (c + 1) * T - 1]; b = f[r * T:(r + 1) * T, (c + 1) * T]
+            dr[r, c] = np.median(b - a, axis=0)
+    for r in range(nz - 1):
+        for c in range(nx):
+            a = f[(r + 1) * T - 1, c * T:(c + 1) * T]; b = f[(r + 1) * T, c * T:(c + 1) * T]
+            dd[r, c] = np.median(b - a, axis=0)
+    # ignore large legitimate steps (shorelines crossing an edge)
+    dr = np.where(np.abs(dr) < 40, dr, 0); dd = np.where(np.abs(dd) < 40, dd, 0)
+    for _ in range(400):                         # Jacobi iterations of the least-squares system
+        acc = np.zeros_like(o); cnt = np.zeros((nz, nx, 1), np.float32)
+        acc[:, :-1] += o[:, 1:] + dr; cnt[:, :-1] += 1        # o_left = o_right + d  (cancels the step)
+        acc[:, 1:] += o[:, :-1] - dr; cnt[:, 1:] += 1
+        acc[:-1] += o[1:] + dd; cnt[:-1] += 1
+        acc[1:] += o[:-1] - dd; cnt[1:] += 1
+        o = acc / np.maximum(cnt, 1)
+        o -= o.mean(axis=(0, 1), keepdims=True)
+    # offsets are piecewise constant per tile; a hard per-tile offset exactly cancels the edge steps
+    field = np.repeat(np.repeat(o, T, 0), T, 1)
+    out = img.copy()
+    out[..., :3] = np.clip(f + field, 0, 255).astype(np.uint8)
+    return out
+
+
+BUILDINGS = os.environ.get("SR_BUILDINGS", "1") == "1"
+ROT_MODE = os.environ.get("SR_ROT", "yaw")
+ROT_SIGN = float(os.environ.get("SR_ROTSIGN", "1"))
+ROOF = np.array([176, 172, 164], np.float32)
+
+
+def draw_footprints(baked, items, canvas, treemask, shadow, half_x, half_z, px_per_m, size, log=print):
+    a = baked[..., 3].astype(np.float32) / 255
+    bh, bw = a.shape
+    tm = Image.new("L", (bw, bh), 0); dr = ImageDraw.Draw(tm)
+    for x, zz, r, col, kind in items:
+        cx = (x + half_x) / 0.75; cy = (zz + half_z) / 0.75; R = max(r / 0.75 * 1.4, 2.5)
+        dr.ellipse((cx - R, cy - R, cx + R, cy + R), fill=255)
+    trees = np.asarray(tm) > 0
+    m = Image.fromarray(((a < 0.42) & ~trees).astype(np.uint8) * 255)
+    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    # drop specks smaller than ~6 m2
+    arr = np.asarray(m) > 0
+    small = np.asarray(Image.fromarray(arr.astype(np.uint8) * 255).filter(ImageFilter.BoxBlur(2)), np.float32) / 255
+    arr &= small > 0.22
+    big = Image.fromarray(arr.astype(np.uint8) * 255).crop((0, 0, int(round(2 * half_x / 0.75)), int(round(2 * half_z / 0.75))))
+    big = big.resize(size, Image.BILINEAR).filter(ImageFilter.GaussianBlur(px_per_m * 0.25))
+    fp = np.asarray(big, np.float32) / 255
+    fp = np.clip((fp - 0.35) * 4, 0, 1)                  # crisp edge
+    if fp.max() == 0:
+        return
+    # shadow: footprint shifted along the sun (from -x) by ~5 m
+    off = int(5 * px_per_m)
+    sh = np.zeros_like(fp); sh[:, off:] = fp[:, :-off] if off else fp
+    shadow.paste(Image.fromarray(np.maximum(np.asarray(shadow), (sh * 170).astype(np.uint8))))
+    base = np.asarray(canvas, np.float32)
+    edge = np.clip(fp - np.asarray(Image.fromarray((fp * 255).astype(np.uint8)).filter(ImageFilter.MinFilter(3)), np.float32) / 255, 0, 1)
+    roof = ROOF * (1 - 0.35 * edge[..., None])
+    out = base * (1 - fp[..., None]) + roof * fp[..., None]
+    canvas.paste(Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)))
+    treemask.paste(Image.fromarray(np.maximum(np.asarray(treemask), (fp * 255).astype(np.uint8))))
+    log(f"  drew building footprints ({int((fp > 0.5).sum() / px_per_m ** 2)} m2)")
+
+
 # ---------------------------------------------------------------- data_for_ssl.bin landmarks
 _ssl_pat = re.compile(rb"[\x20-\x7e]{3,240}")
 
@@ -231,11 +358,13 @@ def plant_style(name):
     n = name.lower()
     if SKIP.search(n):
         return None
-    if "rock" in n or "stone" in n or "cliff" in n:
-        return ("rock", 1.6)
+    TREE = ("spruce", "tsuga", "pine", "fir", "larch", "cedar", "thuja", "juniper", "sequoia", "maple", "birch",
+            "aspen", "oak", "alder", "poplar", "willow", "elm", "linden", "palm", "acacia", "beech", "tree", "bush")
+    if not any(re.search(r"(^|[/_])" + k, n) for k in TREE) or re.search(r"(^|[/_])fire", n):
+        return None                       # rocks, sheds, caravans, fire stations... are drawn as meshes
     if "burnt" in n or "dry" in n or "dead" in n:
         return ("burnt", 1.6)
-    if "bush" in n or "young" in n or "small" in n:
+    if "bush" in n or "young" in n or "small_tree" in n:
         return ("bush", 1.3)
     if any(k in n for k in ("spruce", "tsuga", "pine", "fir", "larch", "cedar", "thuja", "juniper", "sequoia")):
         return ("conifer", 2.6)
@@ -339,30 +468,106 @@ def euler_matrix(rx, ry, rz):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], np.float32)
 
 
-def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m, log=print):
+def mesh_coverage(w, occ, half_x, half_z, R=0.75):
+    xs = (w[..., 0] + half_x + 0.375) / R; zs = (w[..., 2] + half_z + 0.375) / R
+    u0, v0 = int(xs.min()) - 1, int(zs.min()) - 1; u1, v1 = int(xs.max()) + 2, int(zs.max()) + 2
+    if u0 < 0 or v0 < 0 or u1 >= occ.shape[1] or v1 >= occ.shape[0]:
+        return None
+    im = Image.new("L", (u1 - u0, v1 - v0), 0); d = ImageDraw.Draw(im)
+    for tx, tz in zip(xs, zs):
+        d.polygon([(tx[k] - u0, tz[k] - v0) for k in range(3)], fill=255)
+    msk = np.asarray(im) > 0
+    if msk.sum() < 8:
+        return None
+    return float(occ[v0:v1, u0:u1][msk].mean())
+
+
+def fit_yaw(tris_xz, x, z, sc, occ, half_x, half_z, guess):
+    """Heading (deg) that best matches the game's own baked occlusion around (x, z); None if inconclusive."""
+    R = 0.75
+    best = None
+    pts = tris_xz.reshape(-1, 2) * sc
+    rad = float(np.abs(pts).max()) + 6
+    u0, v0 = int((x - rad + half_x + 0.375) / R), int((z - rad + half_z + 0.375) / R)
+    u1, v1 = int((x + rad + half_x + 0.375) / R) + 1, int((z + rad + half_z + 0.375) / R) + 1
+    if u0 < 0 or v0 < 0 or u1 >= occ.shape[1] or v1 >= occ.shape[0]:
+        return None
+    o = occ[v0:v1, u0:u1]
+    scores = []
+    for ang in range(0, 360, 5):
+        a = np.radians(ang); c, s = np.cos(a), np.sin(a)
+        q = tris_xz.reshape(-1, 3, 2) * sc
+        rx = q[..., 0] * c + q[..., 1] * s + x; rz = -q[..., 0] * s + q[..., 1] * c + z
+        im = Image.new("L", (u1 - u0, v1 - v0), 0); d = ImageDraw.Draw(im)
+        for tx, tz in zip(rx, rz):
+            d.polygon([((tx[k] + half_x + 0.375) / R - u0, (tz[k] + half_z + 0.375) / R - v0) for k in range(3)], fill=255)
+        msk = np.asarray(im) > 0
+        if msk.sum() < 12 or (~msk).sum() < 12:
+            return None
+        scores.append((o[msk].mean() - o[~msk].mean(), ang))
+    scores.sort(reverse=True)
+    top, ang = scores[0]
+    med = np.median([s for s, _ in scores])
+    if top < 0.25 or top - med < 0.08:
+        return None
+    return float(ang)
+
+
+def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m, log=print, skip_flat=False, occ=None):
     """Rasterise every non-plant landmark top-down. Lighting is baked relative to the flat-ground light."""
     cd = ImageDraw.Draw(canvas); md = ImageDraw.Draw(flatmask); sd = ImageDraw.Draw(shadow)
     sun = -np.array([1.0, -1.0, 0.0]); sun /= np.linalg.norm(sun)
     flat_light = SUN_COL.mean() * 0.7 + AMB_UP.mean()
     all_polys = []
     n_inst = 0
+    fitted = [0]
+    skipped = [0]
+    fitted_flag = lambda p: True
     for name, arr in lmk.items():
-        if plant_style(name):
+        is_plant = plant_style(name) is not None
+        if is_plant and not GAME_TREES:
             continue
         m = mesh_triangles(name)
         if m is None:
             continue
         tris, cols = m
+        if skip_flat and float(tris[..., 1].max() - tris[..., 1].min()) < 0.35:
+            continue                      # paving / ground decals: already part of the baked terrain
+        ext = tris.reshape(-1, 3).max(0) - tris.reshape(-1, 3).min(0)
+        fittable = occ is not None and not is_plant and ext[1] > 2.5 and ext[0] * ext[2] > 25
         for p in arr:
+            if fittable:
+                yaw = fit_yaw(tris[..., [0, 2]], p[0], p[2], p[3], occ, half_x, half_z, None)
+                if yaw is not None:
+                    p = p.copy(); p[4:7] = (0, 0, 0); p = np.r_[p[:4], 0, 0, 0]
+                    p[5] = yaw; fitted[0] += 1
             x, y, z, sc = p[:4]
-            R = euler_matrix(*p[4:7]) if len(p) >= 7 else np.eye(3, dtype=np.float32)
+            if len(p) >= 7 and fittable and p[4] == 0 and p[6] == 0 and fitted_flag(p):
+                a = np.radians(p[5]); c, s = np.cos(a), np.sin(a)
+                R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float32)
+            elif len(p) >= 7:
+                R = euler_matrix(*p[4:7]) if ROT_MODE == "full" else euler_matrix(0, p[5] * ROT_SIGN, 0)
+            else:
+                R = np.eye(3, dtype=np.float32)
             w = tris.reshape(-1, 3) @ R.T * sc + np.array([x, y, z], np.float32)
             w = w.reshape(-1, 3, 3)
+            if fittable and occ is not None:
+                # the game's footprint is ground truth: if this mesh doesn't sit on it, the footprint layer
+                # (drawn from the game's own occlusion) shows the building instead
+                cov = mesh_coverage(w, occ, half_x, half_z)
+                if cov is not None and cov < 0.55:
+                    skipped[0] += 1
+                    continue
             nrm = np.cross(w[:, 1] - w[:, 0], w[:, 2] - w[:, 0])
             ln = np.linalg.norm(nrm, axis=1, keepdims=True); ln[ln == 0] = 1; nrm /= ln
             nrm[nrm[:, 1] < 0] *= -1           # top-down view sees the upward side
-            light = (SUN_COL.mean() * np.clip(nrm @ sun, 0, 1) + AMB_MID.mean() + (AMB_UP.mean() - AMB_MID.mean()) * np.clip(nrm[:, 1], 0, 1)) / flat_light
-            shade = np.clip(cols * light[:, None] ** (1 / 2.2), 0, 255)
+            if GAME_TREES:
+                # same lighting the game uses for its map: sun (1,-1,0) + sky ambient, filmic tonemap
+                d_ = np.clip(nrm @ sun, 0, 1).astype(np.float32)
+                shade = tonemap_lmk(cols, d_, np.clip(nrm[:, 1], 0, 1).astype(np.float32))
+            else:
+                light = (SUN_COL.mean() * np.clip(nrm @ sun, 0, 1) + AMB_MID.mean() + (AMB_UP.mean() - AMB_MID.mean()) * np.clip(nrm[:, 1], 0, 1)) / flat_light
+                shade = np.clip(cols * light[:, None] ** (1 / 2.2), 0, 255)
             top = w[:, :, 1].max(1)
             px = (w[:, :, 0] + half_x) * px_per_m; pz = (w[:, :, 2] + half_z) * px_per_m
             hgt = np.clip(top - y, 0, 30)
@@ -376,7 +581,119 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
         sd.polygon([(a + off, b) for a, b in pts], fill=170)
         cd.polygon(pts, fill=tuple(int(c) for c in col))
         md.polygon(pts, fill=255)
-    log(f"  drew {n_inst} landmark meshes ({len(all_polys)} triangles)")
+    log(f"  drew {n_inst} landmark meshes ({len(all_polys)} triangles); {fitted[0]} large ones aligned to the game's footprints, {skipped[0]} replaced by footprints")
+
+
+GAME_TREES = os.environ.get("SR_GAME_TREES", "1") == "1"
+LMK_EXPOSURE = float(os.environ.get("SR_LMK_EXPOSURE", "1.5"))
+
+
+def tonemap_lmk(cols, d, up):
+    lin = (np.clip(cols, 0, 255) / 255.0) ** 2.2
+    amb = AMB_MID + (AMB_UP - AMB_MID) * up[:, None]
+    rad = lin * (SUN_COL * d[:, None] + amb) * LMK_EXPOSURE
+    return np.clip(_filmic(rad) / _filmic(TW), 0, 1) ** (1 / 2.2) * 255
+
+
+# ---------------------------------------------------------------- water
+WATER_SHALLOW = np.array([112, 153, 196], np.float32)   # sampled from the in-game map
+WATER_DEEP = np.array([100, 143, 188], np.float32)
+SHORE = np.array([70, 78, 80], np.float32)
+
+
+def draw_water(z, base, names, img, hs, W, H, size, px_per_m, log=print, baked=None):
+    wn = base + "water_height_map.pct"
+    if wn not in names:
+        return img
+    ww, wh, _ = pct_info(z, wn)
+    wl = np.frombuffer(tail(z, wn, ww * wh * 4), "<f4").reshape(wh, ww).astype(np.float32)
+    ok = np.isfinite(wl) & (np.abs(wl) < 1e5)
+    if ok.sum() < 4:
+        return img
+    # fill invalid vertices from valid neighbours so the level interpolates smoothly up to the shore
+    lv = np.where(ok, wl, 0).astype(np.float32); cnt = ok.astype(np.float32)
+    for _ in range(4):
+        pad_l = np.pad(lv, 1, mode="edge"); pad_c = np.pad(cnt, 1, mode="edge")
+        sl = sum(pad_l[1 + dy:1 + dy + wh, 1 + dx:1 + dx + ww] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        sc = sum(pad_c[1 + dy:1 + dy + wh, 1 + dx:1 + dx + ww] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+        fill = (cnt == 0) & (sc > 0)
+        lv = np.where(fill, sl / np.maximum(sc, 1e-6), lv); cnt = np.where(fill, 1.0, cnt)
+    near = cnt > 0
+    # vertex grid -> output pixels: vertex i sits at texel i*12 of the heightmap, i.e. world spacing 6 m
+    span_x = (ww - 1) * (W - 1) / (ww - 1); span_z = (wh - 1) * (H - 1) / (wh - 1)
+    lvl = Image.fromarray(lv).transform(size, Image.EXTENT, (0, 0, ww - 1, wh - 1), Image.BILINEAR)
+    msk = Image.fromarray(near.astype(np.float32)).transform(size, Image.EXTENT, (0, 0, ww - 1, wh - 1), Image.BILINEAR)
+    lvl = np.asarray(lvl, np.float32); msk = np.asarray(msk, np.float32)
+    depth = np.where(msk > 0.99, lvl - hs, -1.0)
+    if baked is not None:
+        # only where the game itself draws water (its baked map); the level data then gives a sharp shore
+        b = baked[..., :3].astype(np.float32)
+        wet = ((b[..., 2] > b[..., 0] + 18) & (b[..., 2] > b[..., 1] + 4)).astype(np.uint8) * 255
+        hx_, hz_ = (W - 1) / 4, (H - 1) / 4
+        wm = Image.fromarray(wet).crop((0, 0, int(round(2 * hx_ / 0.75)), int(round(2 * hz_ / 0.75))))
+        wm = wm.filter(ImageFilter.MaxFilter(5)).resize(size, Image.BILINEAR)
+        depth = np.where(np.asarray(wm) > 100, depth, -1.0)
+    a = (depth > 0).astype(np.uint8) * 255
+    a = np.asarray(Image.fromarray(a).filter(ImageFilter.GaussianBlur(px_per_m * 0.3)), np.float32) / 255
+    a = np.clip((a - 0.5) * 3 + 0.5, 0, 1)                              # crisp, anti-aliased shoreline
+    ring = np.clip(1 - np.abs(a - 0.5) * 2.2, 0, 1)                     # thin dark line on the shore
+    deep = np.clip(depth / 3.0, 0, 1)[..., None]
+    col = WATER_SHALLOW * (1 - deep) + WATER_DEEP * deep
+    out = img * (1 - a[..., None]) + col * a[..., None]
+    out = out * (1 - 0.55 * ring[..., None]) + SHORE * (0.55 * ring[..., None])
+    log(f"  water: {int((a > 0.5).sum() / px_per_m ** 2)} m2")
+    return out
+
+
+# ---------------------------------------------------------------- vegetation sprites
+SPRITES = os.environ.get("SR_SPRITES", "1") == "1"
+
+
+def stamp_vegetation(stamps, items, canvas, shadow, half_x, half_z, px_per_m, size, log=print):
+    """Stamp real top-down tree sprites. Returns (canvas, shadow, treemask, items still needing discs)."""
+    treemask = Image.new("L", size, 0)
+    if not SPRITES or not stamps:
+        return canvas, shadow, treemask, items
+    try:
+        import treesprites
+    except Exception:
+        return canvas, shadow, treemask, items
+    rgba = canvas.convert("RGBA")
+    cache = {}
+    have = {}
+    leftover_names = set()
+    order = sorted(range(len(stamps)), key=lambda i: stamps[i][1])
+    n = 0
+    for i in order:
+        x, zz, sc, nm, kind = stamps[i]
+        if kind == "rock":
+            continue
+        if nm not in have:
+            have[nm] = treesprites.sprite(nm)
+        sp = have[nm]
+        if sp is None:
+            leftover_names.add(nm); continue
+        arr, res = sp
+        px = max(3, int(round(arr.shape[0] * res * sc * px_per_m)))
+        rot = int((x * 7.13 + zz * 3.71)) % 8
+        key = (nm, px, rot)
+        im = cache.get(key)
+        if im is None:
+            base = Image.fromarray(arr).resize((px, px), Image.LANCZOS if px < arr.shape[0] else Image.BILINEAR)
+            im = base.rotate(rot * 45, resample=Image.BILINEAR, expand=False)
+            cache[key] = im
+        cx = (x + half_x) * px_per_m; cy = (zz + half_z) * px_per_m
+        ox, oy = int(cx - px / 2), int(cy - px / 2)
+        a = im.getchannel("A")
+        # shadow east of the tree (sun from -x, 45 degrees): offset ~ half the crown width
+        shadow.paste(140, (ox + int(px * 0.45), oy + int(px * 0.08)), a)
+        rgba.alpha_composite(im, (max(0, ox), max(0, oy)), (max(0, -ox), max(0, -oy))) if ox < size[0] and oy < size[1] else None
+        treemask.paste(255, (ox, oy), a)
+        n += 1
+    log(f"  stamped {n} tree sprites ({len(have) - len(leftover_names)} species from game meshes); no mesh: {sorted(leftover_names)[:12]}")
+    rest = [it for it, st in zip(items, stamps) if st[3] in leftover_names or st[4] == "rock"]
+    rest = [it for it in rest if it[4] != "rock" or it[2] > 1.2]          # drop pebbles
+    return rgba.convert("RGB"), shadow, treemask, rest
 
 
 # ---------------------------------------------------------------- LUT
@@ -415,6 +732,21 @@ EXPOSURE = float(os.environ.get("SR_EXPOSURE", "2.5"))                # HdrExpos
 HAZE = float(os.environ.get("SR_HAZE", "0.22"))                      # fog seen from the high map camera
 FOG_COL = np.array([184, 218, 243], np.float32)
 TA, TB, TC, TD, TE, TF, TW = 0.1, 0.5, 0.1, 0.3, 0.02, 0.3, 2.2       # Tonemap A..F, ToneMapWhite
+STYLE = os.environ.get("SR_STYLE", "game")       # game (baked tiles) | rebuild (own terrain)
+RELIEF = float(os.environ.get("SR_RELIEF", "0.35"))
+AO_MIN = float(os.environ.get("SR_AO", "1.0"))      # baked occlusion off: it smudges at high zoom
+HAZE_B = float(os.environ.get("SR_HAZE_B", "0.06"))
+SAT = float(os.environ.get("SR_SAT", "0.82"))
+WARM = float(os.environ.get("SR_WARM", "0.0"))
+
+
+def grade(img):
+    """Gentle grade toward the in-game map look: slightly desaturated, neutral."""
+    lum = (img @ np.array([0.299, 0.587, 0.114], np.float32))[..., None]
+    out = lum + (img - lum) * SAT
+    if WARM:
+        out = out * np.array([1 + WARM, 1, 1 - WARM], np.float32)
+    return out
 
 
 def _filmic(x):
@@ -489,8 +821,22 @@ def render(level, px_per_m=2.0, log=print):
     diffuse = np.clip(n @ sun, 0, 1).astype(np.float32)
     up = np.clip(n[..., 1], 0, 1).astype(np.float32)
 
-    # ---- material albedo
-    sets = terrain_materials(stg) if stg else []
+    # ---- terrain colour: the game's own baked map tiles when present (exact roads, ground, water)
+    baked = baked_tiles(stg, W, H) if stg and STYLE != "rebuild" else None
+    if baked is not None:
+        bk = Image.fromarray(baked).crop((0, 0, int(round(2 * half_x / 0.75)), int(round(2 * half_z / 0.75))))
+        base_rgb = None
+        try:
+            import terrain
+            base_rgb = terrain.render_ground(z, level, stg, baked, half_x, half_z, px_per_m, size, log)
+        except Exception as e:
+            import traceback; log("  full-res ground failed: " + traceback.format_exc())
+        if base_rgb is None:
+            base_rgb = np.asarray(bk.convert("RGB").resize(size, Image.LANCZOS), np.float32)
+        ao = np.asarray(bk.getchannel("A").resize(size, Image.BILINEAR), np.float32) / 255
+        log(f"  using the game's baked map tiles ({baked.shape[1]}x{baked.shape[0]})")
+    # ---- material albedo (fallback when a level has no baked tiles)
+    sets = terrain_materials(stg) if stg and baked is None else []
     albedo = np.full((OH, OW, 3), (104, 100, 78), np.float32)
     bn = base + "blend_map__cmp.pct"
     if bn in names and sets:
@@ -522,7 +868,7 @@ def render(level, px_per_m=2.0, log=print):
 
     # mud
     en = base + "extrude_map.pct"
-    if en in names:
+    if en in names and baked is None:
         ew, eh, _ = pct_info(z, en)
         e = np.frombuffer(tail(z, en, ew * eh), np.uint8).reshape(eh, ew)
         e = resize_f(e.astype(np.float32) / 255, size, Image.BOX)
@@ -530,43 +876,13 @@ def render(level, px_per_m=2.0, log=print):
         a = np.clip(e * 0.75, 0, 0.75)[..., None]
         albedo = albedo * (1 - a) + mud * a
 
-    img = albedo
+    img = albedo if baked is None else base_rgb
 
-    # ---- water
-    wn = base + "water_height_map.pct"
-    if wn in names:
-        try:
-            ww, wh, _ = pct_info(z, wn)
-            wr = np.frombuffer(tail(z, wn, ww * wh * 4), "<u2").reshape(wh, ww, 2)[..., 0]
-            wf = wr.view("<f2").astype(np.float32)
-            mask = wr < 0x7000
-            if mask.sum() > 20:
-                cy, cx = H // wh, W // ww
-                cells = hm[: wh * cy, : ww * cx].reshape(wh, cy, ww, cx)
-                cmin, cmax = cells.min(axis=(1, 3)), cells.max(axis=(1, 3))
-                A, B = np.polyfit(wf[mask], cmin[mask], 1)
-                lvl = A * wf + B - 0.004 * 65535
-                shore = mask & (lvl > cmin) & (lvl < cmax)
-                flooded = mask & (lvl >= cmax)
-                keep = shore.copy()
-                for _ in range(max(wh, ww)):
-                    g = keep.copy()
-                    g[1:] |= keep[:-1]; g[:-1] |= keep[1:]; g[:, 1:] |= keep[:, :-1]; g[:, :-1] |= keep[:, 1:]
-                    g &= (shore | flooded)
-                    if (g == keep).all():
-                        break
-                    keep = g
-                lvl = np.where(keep, lvl, -1e9).astype(np.float32)
-                lvl_m = resize_f(lvl, size, Image.NEAREST) * k_h + b_h
-                m_up = resize_f(keep.astype(np.float32), size)
-                depth = np.where(m_up > 0.3, lvl_m - hs, -1)
-                wa = np.clip(depth / 0.6, 0, 1)
-                wa = resize_f(wa, size)  # soften
-                deep = np.clip(depth / 2.5, 0, 1)
-                wcol = np.array([96, 128, 150], np.float32) * (1 - deep[..., None]) + np.array([60, 92, 120], np.float32) * deep[..., None]
-                img = img * (1 - wa[..., None] * 0.85) + wcol * (wa[..., None] * 0.85)
-        except Exception as e:
-            log(f"  water skipped: {e}")
+    # ---- water from the game's water levels (metres, one vertex every 12 heightmap texels)
+    try:
+        img = draw_water(z, base, names, img, hs, W, H, size, px_per_m, log, baked)
+    except Exception as e:
+        log(f"  water skipped: {e}")
 
     # ---- vegetation: shadows then canopies
     canvas = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
@@ -578,10 +894,14 @@ def render(level, px_per_m=2.0, log=print):
         st = plant_style(nm)
         if st:
             styles[i] = (st, plant_color(nm, st[0]))
+    stamps = []          # (x, z, scale, name) for sprite stamping
     for t_id, (st, col) in styles.items():
         sel = plants[plants[:, 0] == t_id] if len(plants) else []
+        nm = plant_names[t_id]
         for p in sel:
-            items.append((p[1], p[3], st[1] * min(max(p[4], 0.4), 2.5), col, st[0]))
+            sc = min(max(float(p[4]), 0.4), 3.0)
+            items.append((p[1], p[3], st[1] * min(sc, 2.5), col, st[0]))
+            stamps.append((p[1], p[3], sc, nm, st[0]))
     for nm, arr in lmk.items():
         st = plant_style(nm)
         if not st:
@@ -589,9 +909,18 @@ def render(level, px_per_m=2.0, log=print):
         col = plant_color(nm, st[0])
         r = st[1] * 1.25
         for p in arr:
-            items.append((p[0], p[2], r * min(max(p[3], 0.4), 2.5), col, st[0]))
+            sc = min(max(float(p[3]), 0.4), 3.0)
+            items.append((p[0], p[2], r * min(sc, 2.5), col, st[0]))
+            stamps.append((p[0], p[2], sc, nm, st[0]))
     log(f"  drawing {len(items)} plants")
-    # sun from -x: shadows fall to +x
+    all_items = list(items)
+    if GAME_TREES and lmk:
+        treemask_pre = Image.new("L", size, 0); items = []
+        log("  vegetation: the game's landmark tree models")
+    else:
+        canvas, shadow, treemask_pre, items = stamp_vegetation(stamps, items, canvas, shadow, half_x, half_z, px_per_m, size, log)
+    sd = ImageDraw.Draw(shadow)
+    # sun from -x: shadows fall to +x  (fallback discs for plants without a mesh sprite)
     for x, zz, r, col, kind in items:
         cx = (x + half_x) * px_per_m; cy = (zz + half_z) * px_per_m
         R = r * px_per_m
@@ -599,7 +928,7 @@ def render(level, px_per_m=2.0, log=print):
         sd.ellipse((cx - R + off, cy - R * 0.85, cx + R + off, cy + R * 0.85), fill=150)
     shadow = shadow.filter(ImageFilter.GaussianBlur(max(1, px_per_m * 0.8)))
     sh = np.asarray(shadow, np.float32) / 255
-    treemask = Image.new("L", size, 0)
+    treemask = treemask_pre
     tmd = ImageDraw.Draw(treemask)
     cd = ImageDraw.Draw(canvas)
     lit = 1.0
@@ -614,33 +943,46 @@ def render(level, px_per_m=2.0, log=print):
         cd.ellipse((cx - R * 0.85, cy - R * 0.85, cx + R * 0.55, cy + R * 0.55), fill=mid)
         if R > 2.5:
             cd.ellipse((cx - R * 0.7, cy - R * 0.7, cx - R * 0.05, cy - R * 0.05), fill=hi)
-    # buildings, bridges, fences, vehicles... drawn above the vegetation (they are mostly in clearings)
+    # buildings that are level prefabs (garages, houses...) have no landmark mesh; the baked occlusion
+    # records their footprints as sharp dark shapes, so draw those that are not trees as roofs
     mshadow = Image.new("L", size, 0)
+    if baked is not None and BUILDINGS:
+        try:
+            draw_footprints(baked, all_items, canvas, treemask, mshadow, half_x, half_z, px_per_m, size, log)
+        except Exception as e:
+            log(f"  footprints skipped: {e}")
     try:
-        draw_landmark_meshes(lmk, canvas, treemask, mshadow, half_x, half_z, px_per_m, log)
+        occ_g = (1 - baked[..., 3].astype(np.float32) / 255) if baked is not None else None
+        draw_landmark_meshes(lmk, canvas, treemask, mshadow, half_x, half_z, px_per_m, log, skip_flat=baked is not None, occ=occ_g)
     except Exception as e:
         log(f"  landmark meshes skipped: {e}")
     mshadow = mshadow.filter(ImageFilter.GaussianBlur(max(1, px_per_m * 0.6)))
     sh = np.maximum(sh, np.asarray(mshadow, np.float32) / 255 * 0.9)
     alb = np.asarray(canvas, np.float32)
     tm = np.asarray(treemask, np.float32) / 255
-    # tree canopies face the sky: flat lighting, their shading is baked into the drawn colour
-    d_sun = diffuse * (1 - tm) + 0.7 * tm
-    d_sun = d_sun * (1 - 0.8 * sh * (1 - tm))
-    a_up = up * (1 - tm) + tm
-    img = tonemap(alb, d_sun, a_up)
-    img = img * (1 - HAZE) + FOG_COL * 0.8 * HAZE
-
-    # ---- the game's minimap colour grade
-    img = apply_lut(img)
+    if baked is not None:
+        # baked terrain is already lit; add the map sun's relief, tree/building shadows and baked occlusion
+        g = 1.0 + RELIEF * (diffuse - 0.707)
+        g = g * (1 - 0.42 * sh) * (AO_MIN + (1 - AO_MIN) * ao)
+        g = g * (1 - tm) + tm
+        img = alb * g[..., None]
+        img = img * (1 - HAZE_B) + FOG_COL * 0.8 * HAZE_B
+        img = grade(img)
+    else:
+        d_sun = diffuse * (1 - tm) + 0.7 * tm
+        d_sun = d_sun * (1 - 0.8 * sh * (1 - tm))
+        a_up = up * (1 - tm) + tm
+        img = tonemap(alb, d_sun, a_up)
+        img = img * (1 - HAZE) + FOG_COL * 0.8 * HAZE
+        img = apply_lut(img)
     out = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
     meta = {"w": W, "h": H, "half_x": half_x, "half_z": half_z, "img_w": OW, "img_h": OH,
-            "px_per_m": px_per_m, "k_h": k_h, "b_h": b_h, "plants": len(items), "version": 3}
+            "px_per_m": px_per_m, "k_h": k_h, "b_h": b_h, "plants": len(all_items), "version": 5, "baked": baked is not None}
     log(f"  done in {time.time() - t0:.1f}s")
     return out, meta, hm
 
 
-def build(level, px_per_m=2.0, log=print):
+def build(level, px_per_m=3.0, log=print):
     os.makedirs(OUT, exist_ok=True)
     img, meta, hm = render(level, px_per_m, log)
     img.save(os.path.join(OUT, level + ".jpg"), quality=90, optimize=True)

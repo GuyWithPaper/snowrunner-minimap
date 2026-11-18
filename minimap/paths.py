@@ -1,10 +1,17 @@
 """Where things live: the game install (any Steam library), and per-user app data."""
 import os, re, sys, winreg
 
-APP_NAME = "SnowRunnerMinimap"
+APP_NAME = "MapRunner"
 FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+_LA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+DATA = os.path.join(_LA, APP_NAME)
+_OLD = os.path.join(_LA, "SnowRunnerMinimap")              # pre-rename data (drawn maps, pins, settings)
+if not os.path.exists(DATA) and os.path.isdir(_OLD):
+    try:
+        os.rename(_OLD, DATA)
+    except OSError:
+        DATA = _OLD
 MAPS = os.path.join(DATA, "maps")
 os.makedirs(MAPS, exist_ok=True)
 SETTINGS = os.path.join(DATA, "settings.json")

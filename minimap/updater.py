@@ -1,6 +1,6 @@
 """Auto-update from GitHub Releases.
 
-Publishing a new version = creating a GitHub release tagged vX.Y.Z with SnowRunnerMinimap-Setup.exe attached
+Publishing a new version = creating a GitHub release tagged vX.Y.Z with MapRunner-Setup.exe attached
 (release.ps1 does this). Installed copies check on start and every few hours, download the new setup,
 run it silently, and the installer restarts the app.
 """
@@ -9,7 +9,7 @@ import json, os, subprocess, sys, tempfile, threading, time, urllib.request
 from version import VERSION, REPO
 
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
-UA = {"User-Agent": "SnowRunnerMinimap-updater", "Accept": "application/vnd.github+json"}
+UA = {"User-Agent": "MapRunner-updater", "Accept": "application/vnd.github+json"}
 
 
 def _ver(s):
@@ -43,7 +43,7 @@ def check(log=print):
 
 def install(url, log=print):
     """Download the setup and run it silently; caller should quit right after."""
-    dst = os.path.join(tempfile.gettempdir(), "SnowRunnerMinimap-Setup.exe")
+    dst = os.path.join(tempfile.gettempdir(), "MapRunner-Setup.exe")
     req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
     with urllib.request.urlopen(req, timeout=120) as r, open(dst, "wb") as f:
         while True:
