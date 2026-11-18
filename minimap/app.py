@@ -23,7 +23,7 @@ from settingswin import SettingsWindow, STYLE, dark_title_bar
 from version import VERSION
 
 u32 = ctypes.windll.user32
-MAP_VERSION = 5
+MAP_VERSION = 6
 
 
 def log(*a):

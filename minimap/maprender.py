@@ -344,7 +344,10 @@ def ssl_landmarks(data, limit):
         if ok[: min(cnt, 24)].mean() < 0.8:
             continue
         sc = np.where((f[:, 3] > 0.01) & (f[:, 3] < 100), f[:, 3], 1.0)
-        rot = (rec[:, 16:19].astype(np.float32) - 128.0) * (180.0 / 127.0)   # euler XYZ degrees
+        # orientation: packed quaternion (x, y, z, w), each byte = (b - 128) / 127, normalised
+        # (verified: consecutive bridge spans line up exactly with this decoding)
+        rot = (rec[:, 16:20].astype(np.float32) - 128.0) / 127.0
+        rot /= np.maximum(np.linalg.norm(rot, axis=1, keepdims=True), 1e-6)
         groups.setdefault(text, []).append(np.c_[f[ok, 0], f[ok, 1], f[ok, 2], sc[ok], rot[ok]])
     return {k: np.concatenate(v) for k, v in groups.items()}
 
@@ -457,6 +460,13 @@ def mesh_triangles(lmk_name):
     return res
 
 
+def quat_matrix(q):
+    x, y, z, w = (float(v) for v in q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], np.float32)
+
+
 def euler_matrix(rx, ry, rz):
     """Same convention as the SnowrunnerMapConverter (XYZ euler -> quaternion -> matrix)."""
     hx, hy, hz = np.radians([rx, ry, rz]) * 0.5
@@ -534,21 +544,16 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
         if skip_flat and float(tris[..., 1].max() - tris[..., 1].min()) < 0.35:
             continue                      # paving / ground decals: already part of the baked terrain
         ext = tris.reshape(-1, 3).max(0) - tris.reshape(-1, 3).min(0)
-        fittable = occ is not None and not is_plant and ext[1] > 2.5 and ext[0] * ext[2] > 25
+        if map_clutter(name, ext):
+            continue
+        nl = name.lower()
+        if is_plant and ("burnt" in nl or "dry" in nl) and float(np.median(cols @ np.array([0.3, 0.59, 0.11]))) < 75:
+            continue                      # leafless snag: bare branches read as black star bursts from above
+        cols = map_tint(name, cols)
+        fittable = occ is not None and not is_plant and "bridge" not in name.lower() and ext[1] > 2.5 and ext[0] * ext[2] > 25
         for p in arr:
-            if fittable:
-                yaw = fit_yaw(tris[..., [0, 2]], p[0], p[2], p[3], occ, half_x, half_z, None)
-                if yaw is not None:
-                    p = p.copy(); p[4:7] = (0, 0, 0); p = np.r_[p[:4], 0, 0, 0]
-                    p[5] = yaw; fitted[0] += 1
             x, y, z, sc = p[:4]
-            if len(p) >= 7 and fittable and p[4] == 0 and p[6] == 0 and fitted_flag(p):
-                a = np.radians(p[5]); c, s = np.cos(a), np.sin(a)
-                R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float32)
-            elif len(p) >= 7:
-                R = euler_matrix(*p[4:7]) if ROT_MODE == "full" else euler_matrix(0, p[5] * ROT_SIGN, 0)
-            else:
-                R = np.eye(3, dtype=np.float32)
+            R = quat_matrix(p[4:8]) if len(p) >= 8 else np.eye(3, dtype=np.float32)
             w = tris.reshape(-1, 3) @ R.T * sc + np.array([x, y, z], np.float32)
             w = w.reshape(-1, 3, 3)
             if fittable and occ is not None:
@@ -585,6 +590,34 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
 
 
 GAME_TREES = os.environ.get("SR_GAME_TREES", "1") == "1"
+_CLUTTER = re.compile(r"(lying|stub|stump|_log|logs_|chunk|branch|fence|pole|barrier|pallet|scaffold|sign|flag|banner|"
+                      r"pipe|wire|cable|bump|board|plank|barrel|bucket|box_|boxes|trash|garbage|tire|wheel|bottle|"
+                      r"bench|lamp|light_|cone|post|rail_?road_base|pirs_small|grass|flower|bush_small)")
+
+
+def map_clutter(name, ext):
+    """Objects too small or thin to read on a map (the in-game map doesn't show them either)."""
+    n = name.split("/")[-1].lower()
+    if _CLUTTER.search(n) and "bridge" not in n:
+        return True
+    footprint = float(ext[0] * ext[2])
+    if "rock" in n:
+        return footprint < 6.0          # keep boulders and cliffs, drop pebbles
+    if plant_style(name):
+        # leafless snags (burnt / dry trunks) read as black star bursts from above
+        bare = n.startswith("burnt") or "dry" in n or "dead" in n
+        return bare and min(ext[0], ext[2]) < 1.2
+    return footprint < 3.0 and ext[1] < 4.0
+
+
+def map_tint(name, cols):
+    n = name.split("/")[-1].lower()
+    if n.startswith("burnt") or "_burnt" in n or "burned" in n:
+        lum = cols @ np.array([0.3, 0.59, 0.11], np.float32)
+        return np.clip(np.stack([lum * 0.78, lum * 0.66, lum * 0.56], -1) * 0.75, 0, 255)   # charred
+    if "rock" in n or "cliff" in n or "stone" in n:
+        return cols * 0.72               # the tree lighting would wash rocks out to white
+    return cols
 LMK_EXPOSURE = float(os.environ.get("SR_LMK_EXPOSURE", "1.5"))
 
 
@@ -977,7 +1010,7 @@ def render(level, px_per_m=2.0, log=print):
         img = apply_lut(img)
     out = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
     meta = {"w": W, "h": H, "half_x": half_x, "half_z": half_z, "img_w": OW, "img_h": OH,
-            "px_per_m": px_per_m, "k_h": k_h, "b_h": b_h, "plants": len(all_items), "version": 5, "baked": baked is not None}
+            "px_per_m": px_per_m, "k_h": k_h, "b_h": b_h, "plants": len(all_items), "version": 6, "baked": baked is not None}
     log(f"  done in {time.time() - t0:.1f}s")
     return out, meta, hm
 
