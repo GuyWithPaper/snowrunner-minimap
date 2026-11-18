@@ -41,6 +41,32 @@ def check(log=print):
     return None
 
 
+def download(url, tag, log=print):
+    """Download the setup for `tag` (kept between runs, so a pending update survives a restart)."""
+    dst = os.path.join(tempfile.gettempdir(), f"MapRunner-Setup-{tag}.exe")
+    if os.path.exists(dst) and os.path.getsize(dst) > 1_000_000:
+        return dst
+    tmp = dst + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
+    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+        while True:
+            b = r.read(1 << 16)
+            if not b:
+                break
+            f.write(b)
+    if os.path.getsize(tmp) < 1_000_000:
+        os.remove(tmp); raise IOError("download too small")
+    os.replace(tmp, dst)
+    log(f"downloaded update {tag} to {dst}")
+    return dst
+
+
+def run_setup(path):
+    """Run a downloaded setup silently; it closes this app, installs, and starts the new version."""
+    subprocess.Popen([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+                     close_fds=True, creationflags=0x00000008)
+
+
 def install(url, log=print):
     """Download the setup and run it silently; caller should quit right after."""
     dst = os.path.join(tempfile.gettempdir(), "MapRunner-Setup.exe")

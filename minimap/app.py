@@ -177,8 +177,14 @@ class Welcome(QDialog):
 
 # ---------------------------------------------------------------- overlay window
 class Overlay(QWidget):
+    sig_update = Signal(str, str, bool)
+    sig_notify = Signal(str)
+
     def __init__(self):
         super().__init__()
+        self.pending_update = None
+        self.sig_update.connect(self._on_update_ready)
+        self.sig_notify.connect(lambda m: self.notify(m, force=True))
         self.s = S.load()
         self.setWindowTitle("Map Runner")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -397,24 +403,50 @@ class Overlay(QWidget):
 
     # ---------- updates
     def check_updates(self, manual=False):
+        """Check and download in the background; install only when SnowRunner isn't running (or on request)."""
         if not manual and not self.s["auto_update"]:
             return
+        if getattr(self, "_upd_busy", False):
+            return
+        self._upd_busy = True
         def run():
-            if not updater.can_self_update():
-                if manual: self.notify("Running from source; updates come from git.", force=True)
-                return
-            r = updater.check(log=log)
-            if not r:
-                if manual: self.notify(f"You're on the latest version ({VERSION}).", force=True)
-                return
-            tag, url = r
-            self.notify(f"Updating to {tag}. The minimap restarts in a moment.", force=True)
             try:
-                updater.install(url, log=log)
-                QTimer.singleShot(0, QApplication.quit)
+                if not updater.can_self_update():
+                    if manual: self.sig_notify.emit("Running from source; updates come from git.")
+                    return
+                r = updater.check(log=log)
+                if not r:
+                    if manual: self.sig_notify.emit(f"You're on the latest version ({VERSION}).")
+                    return
+                tag, url = r
+                path = updater.download(url, tag, log=log)
+                self.sig_update.emit(tag, path, bool(manual))
             except Exception as e:
-                log("update failed", e); self.notify("The update couldn't be downloaded. It will retry later.", force=True)
+                log("update failed", e)
+                if manual: self.sig_notify.emit("The update couldn't be downloaded. It will retry later.")
+            finally:
+                self._upd_busy = False
         threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_ready(self, tag, path, manual):
+        self.pending_update = (tag, path)
+        if manual or not self.game_running:
+            self.apply_update()
+        else:
+            self.notify(f"Map Runner {tag} is ready. It installs when you close SnowRunner.")
+
+    def apply_update(self):
+        if not getattr(self, "pending_update", None):
+            return
+        tag, path = self.pending_update
+        self.pending_update = None
+        log("installing update", tag)
+        self.notify(f"Updating Map Runner to {tag}…", force=True)
+        try:
+            updater.run_setup(path)
+            QTimer.singleShot(1500, QApplication.quit)
+        except Exception as e:
+            log("update failed", e)
 
     def notify(self, msg, force=False):
         log(msg)
@@ -809,6 +841,8 @@ class Overlay(QWidget):
             st = self.reader.read()
         except ConnectionError:
             self.state = None; self.level = None; self.game_running = False
+            if self.pending_update:
+                QTimer.singleShot(3000, self.apply_update)
             if self.detector: self.detector.reset()
             self.status = "Waiting for SnowRunner…"; self.refresh_visibility(); self.update(); return
         except Exception:
