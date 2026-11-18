@@ -1,4 +1,4 @@
-﻿; Inno Setup script. Built by release.ps1, which passes /DAppVersion=x.y.z
+; Inno Setup script. Built by release.ps1, which passes /DAppVersion=x.y.z
 #ifndef AppVersion
   #define AppVersion "1.0.0"
 #endif
@@ -18,13 +18,24 @@ SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\MapRunner.exe
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern
+WizardStyle=modern dark
+WizardImageFile=art\wizard_164.bmp,art\wizard_192.bmp,art\wizard_246.bmp,art\wizard_273.bmp,art\wizard_328.bmp,art\wizard_410.bmp
+WizardSmallImageFile=art\small_55.bmp,art\small_64.bmp,art\small_69.bmp,art\small_83.bmp,art\small_92.bmp,art\small_110.bmp,art\small_119.bmp,art\small_138.bmp
+WizardImageStretch=no
+DisableWelcomePage=no
+AppPublisherURL=https://github.com/GuyWithPaper/snowrunner-minimap
+AppSupportURL=https://github.com/GuyWithPaper/snowrunner-minimap/issues
+AppUpdatesURL=https://github.com/GuyWithPaper/snowrunner-minimap/releases
+AppCopyright=Map Runner contributors
+VersionInfoVersion={#AppVersion}
+VersionInfoDescription=Map Runner Setup
+VersionInfoProductName=Map Runner
 CloseApplications=force
 RestartApplications=no
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "autostart"; Description: "Start the minimap automatically with Windows"; GroupDescription: "Startup:"
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts"
+Name: "autostart"; Description: "Start Map Runner with Windows (it stays in the tray until SnowRunner runs)"; GroupDescription: "Startup"
 
 [Files]
 Source: "..\build\pyi\dist\MapRunner\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -50,7 +61,7 @@ begin
 end;
 
 [Run]
-Filename: "{app}\MapRunner.exe"; Description: "Start Map Runner"; Flags: nowait postinstall
+Filename: "{app}\MapRunner.exe"; Description: "Launch Map Runner now"; Flags: nowait postinstall
 
 [UninstallRun]
 Filename: "taskkill"; Parameters: "/F /IM MapRunner.exe"; Flags: runhidden; RunOnceId: "KillApp"
@@ -58,3 +69,12 @@ Filename: "taskkill"; Parameters: "/F /IM MapRunner.exe"; Flags: runhidden; RunO
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\MapRunner"
 
+
+[Messages]
+WelcomeLabel1=Welcome to Map Runner
+WelcomeLabel2=Map Runner is a live minimap for SnowRunner. It follows your truck and draws each region from your own game files, with fog of war, the game's map markers, waypoints and pins.%n%nIt installs for your Windows account only and needs no administrator rights. It keeps itself up to date automatically.%n%nTip: play SnowRunner in Borderless or Windowed mode so the minimap can appear on top.
+FinishedHeadingLabel=Map Runner is ready
+FinishedLabelNoIcons=Start SnowRunner and get in a truck. Press Ctrl+Shift+M to show or hide the minimap, Ctrl+Shift+F for the big map, and Ctrl+Shift+O for settings.
+FinishedLabel=Start SnowRunner and get in a truck. Press Ctrl+Shift+M to show or hide the minimap, Ctrl+Shift+F for the big map, and Ctrl+Shift+O for settings.
+SelectTasksDesc=Choose a few options before installing.
+ReadyLabel1=Map Runner is ready to install.
