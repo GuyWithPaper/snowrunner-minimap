@@ -1,0 +1,7 @@
+build/
+dist/
+__pycache__/
+*.pyc
+installer/file_version.txt
+*.pkl
+*.log
