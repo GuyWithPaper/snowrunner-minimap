@@ -456,10 +456,23 @@ class Overlay(QWidget):
     # ---------- tray
     def make_tray(self):
         ip = os.path.join(paths.APP_DIR, "assets", "icon.ico")
-        self.tray = QSystemTrayIcon(QIcon(ip) if os.path.exists(ip) else self.windowIcon(), self)
+        icon = QIcon(ip) if os.path.exists(ip) else QIcon()
+        if icon.isNull():
+            # never leave the tray empty: draw a fallback icon
+            from PySide6.QtGui import QPixmap
+            pm = QPixmap(64, 64); pm.fill(Qt.transparent)
+            q = QPainter(pm); q.setRenderHint(QPainter.Antialiasing)
+            q.setBrush(QColor(30, 34, 38)); q.setPen(QPen(QColor(230, 220, 190), 4)); q.drawEllipse(4, 4, 56, 56)
+            q.setBrush(QColor(255, 196, 0)); q.setPen(QPen(QColor(20, 20, 20), 2))
+            q.drawPolygon(QPolygonF([QPointF(32, 12), QPointF(46, 48), QPointF(32, 40), QPointF(18, 48)])); q.end()
+            icon = QIcon(pm)
+            log("tray: icon file missing, using fallback", ip)
+        self.tray = QSystemTrayIcon(icon, self)
         self.tray.activated.connect(lambda r: self.open_settings() if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
         self.update_tray()
         self.tray.show()
+        log("tray icon", "visible" if self.tray.isVisible() else "NOT visible",
+            "(system tray available)" if QSystemTrayIcon.isSystemTrayAvailable() else "(no system tray)")
 
     def update_tray(self):
         hk = self.s["hotkeys"]

@@ -3,7 +3,8 @@ import os, re, sys, winreg
 
 APP_NAME = "MapRunner"
 FROZEN = getattr(sys, "frozen", False)
-APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# bundled data (assets/...): PyInstaller puts it in sys._MEIPASS (the _internal folder)
+APP_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)) if FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _LA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
 DATA = os.path.join(_LA, APP_NAME)
 _OLD = os.path.join(_LA, "SnowRunnerMinimap")              # pre-rename data (drawn maps, pins, settings)
