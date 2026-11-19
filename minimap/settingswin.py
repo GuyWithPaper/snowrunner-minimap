@@ -378,6 +378,14 @@ class SettingsWindow(QDialog):
             c = QCheckBox(label.replace("&", "&&")); c.setChecked(self.s["marker_filter"].get(k, True))
             c.toggled.connect(lambda x, k=k: self.set("marker_filter", x, k))
             grid.addWidget(c, i // 2, i % 2)
+        f = self.group(v, "Route to waypoint")
+        self.check(f, "Plan a route to my waypoint (only through ground I've uncovered)", "route")
+        self.combo(f, "Route style", "route_style", [("balanced", "Balanced (roads where it helps)"),
+                                                     ("roads", "Stick to roads, avoid mud and water"),
+                                                     ("shortest", "Shortest (only avoid what's impassable)")])
+        self.color(f, "Route colour", "route_color")
+        self.hint(f, "Set a waypoint by right-clicking the big map. The route avoids trees, buildings, cliffs, deep water and "
+                     "anything still under fog of war, and re-plans if you leave it.")
         f = self.group(v, "Trail")
         self.check(f, "Draw the path you've driven", "trail")
         self.color(f, "Trail colour", "trail_color")

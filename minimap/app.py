@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QSystemTrayIcon, QMenu, QM
                                QPushButton, QHBoxLayout, QInputDialog, QColorDialog, QLineEdit, QListWidget,
                                QListWidgetItem, QGraphicsOpacityEffect)
 
-import reader as rd, levels, maprender, savedata, updater, icons
+import reader as rd, levels, maprender, savedata, updater, icons, routing
 from settingswin import SettingsWindow, STYLE, dark_title_bar
 from version import VERSION
 
@@ -190,6 +190,10 @@ class Overlay(QWidget):
         super().__init__()
         self.pending_update = None
         self.view = "map"            # big-mode content: "map" | "settings"
+        self.route = None            # {"level","goal","points","length","reached","t","fog"}
+        self._route_busy = False
+        self._route_grids = {}
+        self._route_check = 0.0
         self._from_mini = False      # settings opened from the minimap (closing returns there)
         self._dim = 0.0              # 0 = map, 1 = settings (animated)
         self._anims = []
@@ -350,6 +354,63 @@ class Overlay(QWidget):
         return c[1]
 
     # ---------- settings
+    # ---------- route planning to the waypoint (only through uncovered ground)
+    def _route_grid(self, lv):
+        g = self._route_grids.get(lv)
+        if g is not None:
+            return g
+        try:
+            g = routing.Grid(lv)
+        except Exception:
+            if not run_child(["--routegrid", lv], background=False):
+                return None
+            try:
+                g = routing.Grid(lv)
+            except Exception:
+                return None
+        self._route_grids = {lv: g}
+        return g
+
+    def maybe_route(self, lv, st):
+        if not self.s.get("route", True):
+            self.route = None; return
+        wp = self.waypoint.get(lv)
+        if not wp:
+            self.route = None; return
+        now = time.time()
+        if self._route_busy or now - self._route_check < 0.5:
+            return
+        self._route_check = now
+        r = self.route
+        fog_p = os.path.join(self.save_dir or "", f"fog_{lv}.cfg")
+        fog_t = os.path.getmtime(fog_p) if os.path.exists(fog_p) else 0
+        need = (r is None or r.get("level") != lv or r.get("goal") != wp or r.get("style") != self.s.get("route_style")
+                or (r.get("fog") != fog_t and now - r["t"] > 5))
+        if not need and r and r.get("points"):
+            # off the planned line? re-plan from here
+            d = min(math.hypot(x - st.x, z - st.z) for x, z in r["points"][::3] + [r["points"][-1]])
+            if d > 30 and now - r["t"] > 3:
+                need = True
+        if not need:
+            return
+        self._route_busy = True
+        start = (st.x, st.z); style = self.s.get("route_style", "balanced"); save_dir = self.save_dir
+        def work():
+            try:
+                g = self._route_grid(lv)
+                if g is None:
+                    self.route = {"level": lv, "goal": wp, "points": [], "failed": True, "t": time.time(), "fog": fog_t, "style": style}
+                    return
+                fog = levels.fog(lv, save_dir)
+                res = routing.find_route(g, routing.cost_grid(g, style), routing.fog_mask(g, fog), start, wp)
+                self.route = dict(res or {"points": []}, level=lv, goal=wp, t=time.time(), fog=fog_t, style=style)
+            except Exception:
+                log("route failed", traceback.format_exc())
+            finally:
+                self._route_busy = False
+                QTimer.singleShot(0, self.update)
+        threading.Thread(target=work, daemon=True).start()
+
     # ---------- settings: a view inside the overlay, not a separate window
     def _ensure_settings(self):
         if self.settings_win is None:
@@ -1134,6 +1195,7 @@ class Overlay(QWidget):
                 log("region", lv, levels.display_name(lv))
                 self.store.ensure(lv)
         if lv:
+            self.maybe_route(lv, st)
             tr = self.trails.setdefault(lv, [])
             if not tr or math.hypot(st.x - tr[-1][0], st.z - tr[-1][1]) > 3:
                 tr.append((st.x, st.z))
@@ -1193,7 +1255,24 @@ class Overlay(QWidget):
                 p.setPen(pen); p.setBrush(Qt.NoBrush)
                 p.drawPolyline(QPolygonF([QPointF(a, b) for a, b in tr]))
             wp = self.waypoint.get(lv)
-            if wp and st is not None:
+            rt = self.route if (self.route and self.route.get("level") == lv and self.route.get("goal") == wp) else None
+            if wp and rt and rt.get("points"):
+                pts = [QPointF(st.x, st.z)] if st is not None else []
+                rp = rt["points"]
+                if st is not None:          # start from the nearest point on the route ahead of the truck
+                    k = min(range(0, len(rp)), key=lambda i: (rp[i][0] - st.x) ** 2 + (rp[i][1] - st.z) ** 2)
+                    rp = rp[k:]
+                pts += [QPointF(x, z) for x, z in rp]
+                poly = QPolygonF(pts)
+                col = QColor(self.s.get("route_color", "#4FC3FF"))
+                p.setBrush(Qt.NoBrush)
+                pen = QPen(QColor(0, 0, 0, 170), 6.5 / zoom, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin); p.setPen(pen); p.drawPolyline(poly)
+                pen = QPen(col, 3.6 / zoom, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin); p.setPen(pen); p.drawPolyline(poly)
+                if not rt.get("reached"):
+                    # last stretch into unexplored ground: faint dashes only
+                    pen = QPen(QColor(col.red(), col.green(), col.blue(), 120), 2.2 / zoom); pen.setStyle(Qt.DashLine)
+                    p.setPen(pen); p.drawLine(QPointF(*rt["goal_used"]), QPointF(*wp))
+            elif wp and st is not None:
                 pen = QPen(QColor(90, 200, 255, 230)); pen.setWidthF(2.4 / zoom); pen.setStyle(Qt.DashLine)
                 p.setPen(pen); p.drawLine(QPointF(st.x, st.z), QPointF(*wp))
             p.restore()
@@ -1349,7 +1428,14 @@ class Overlay(QWidget):
             extra.append(f"{self.speed:.0f} km/h" if self.use_metric else f"{self.speed / 1.609:.0f} mph")
         wp = self.waypoint.get(lv)
         if wp and st is not None:
-            extra.append("WP " + self.fmt_dist(math.hypot(wp[0] - st.x, wp[1] - st.z)))
+            rt = self.route if (self.route and self.route.get("level") == lv and self.route.get("goal") == wp) else None
+            if rt and rt.get("points"):
+                rp = rt["points"]
+                k = min(range(len(rp)), key=lambda i: (rp[i][0] - st.x) ** 2 + (rp[i][1] - st.z) ** 2)
+                left = math.hypot(rp[k][0] - st.x, rp[k][1] - st.z) + sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(rp[k:], rp[k + 1:]))
+                extra.append(("Route " if rt.get("reached") else "Route to fog edge ") + self.fmt_dist(left))
+            else:
+                extra.append("WP " + self.fmt_dist(math.hypot(wp[0] - st.x, wp[1] - st.z)))
         if st is not None and self.s["show_coords"]:
             extra.append(f"{st.x:.0f}, {st.z:.0f}")
         status = self.status or ("Preparing map…" if lv and not have_map else "")
@@ -1508,6 +1594,10 @@ def render_cli(argv):
     try:
         maprender.build(lv, px_per_m=q, log=plog)
         save_render_time(time.time() - t0)
+        try:
+            routing.build_grid(lv, log=log)          # route planning data, built with the map
+        except Exception:
+            log("route grid failed", traceback.format_exc())
         return 0
     except Exception:
         log("render failed", lv, traceback.format_exc())
@@ -1563,6 +1653,20 @@ def render_eta(level, started):
     return frac, max(1.0, expected - el)
 
 
+def run_child(args, background=False):
+    import subprocess
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + args
+    else:
+        cmd = [sys.executable, os.path.abspath(__file__)] + args
+    flags = 0x08000000 | (0x00004000 if background else 0)
+    try:
+        return subprocess.run(cmd, creationflags=flags).returncode == 0
+    except Exception:
+        log("child process failed", traceback.format_exc())
+        return False
+
+
 def run_render(level, quality, background=False):
     """Draw a region in a child process; returns True on success. Background ones run at low priority."""
     import subprocess
@@ -1581,6 +1685,11 @@ def run_render(level, quality, background=False):
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--render":
         sys.exit(render_cli(sys.argv[2:]))
+    if len(sys.argv) > 2 and sys.argv[1] == "--routegrid":
+        try:
+            routing.build_grid(sys.argv[2], log=log); sys.exit(0)
+        except Exception:
+            log("route grid failed", traceback.format_exc()); sys.exit(1)
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MapRunner")
     mtx = ctypes.windll.kernel32.CreateMutexW(None, False, "MapRunner_single_instance")

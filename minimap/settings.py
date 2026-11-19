@@ -57,6 +57,9 @@ DEFAULTS = {
     "marker_filter": {k: True for k, _ in MARKER_CATEGORIES},
     "labels": "big",                # never | big | always
     "completed": "dim",             # dim | hide | show  (finished tasks, found watchtowers, collected upgrades)
+    "route": True,
+    "route_style": "balanced",      # balanced | roads | shortest
+    "route_color": "#4FC3FF",
     "trail": True,
     "trail_color": "#FFD23C",
     "trail_length": 4000,
