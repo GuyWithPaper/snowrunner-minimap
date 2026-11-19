@@ -55,9 +55,75 @@ def dark_title_bar(w):
         pass
 
 
+def on_top(dlg):
+    """Qt (non-native) dialog that stays above the always-on-top overlay."""
+    dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+    dlg.setStyleSheet(STYLE)
+    try:
+        dark_title_bar(dlg)
+    except Exception:
+        pass
+    return dlg
+
+
+def pick_color(parent, current, title="Pick colour"):
+    d = QColorDialog(QColor(current), parent)
+    d.setOption(QColorDialog.DontUseNativeDialog, True); d.setWindowTitle(title); on_top(d)
+    return d.selectedColor() if d.exec() else QColor()
+
+
+def pick_folder(parent, title, start):
+    d = QFileDialog(parent, title, start)
+    d.setFileMode(QFileDialog.Directory); d.setOption(QFileDialog.ShowDirsOnly, True)
+    d.setOption(QFileDialog.DontUseNativeDialog, True); on_top(d)
+    return d.selectedFiles()[0] if d.exec() and d.selectedFiles() else ""
+
+
+class Notice(QFrame):
+    """Message strip shown inside the settings panel (never a popup window)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("notice")
+        h = QHBoxLayout(self); h.setContentsMargins(14, 8, 8, 8); h.setSpacing(8)
+        self.text = QLabel(); self.text.setWordWrap(True); h.addWidget(self.text, 1)
+        self.yes = QPushButton("Confirm"); self.yes.setObjectName("primary")
+        self.no = QPushButton("Cancel")
+        self.close_b = QPushButton("Dismiss")
+        for b in (self.yes, self.no, self.close_b):
+            h.addWidget(b)
+        self.no.clicked.connect(self.hide); self.close_b.clicked.connect(self.hide)
+        self._cb = None
+        self.yes.clicked.connect(self._confirm)
+        self.timer = QTimer(self); self.timer.setSingleShot(True); self.timer.timeout.connect(self.hide)
+        self.hide()
+
+    def _confirm(self):
+        cb, self._cb = self._cb, None
+        self.hide()
+        if cb:
+            cb()
+
+    def show_msg(self, text, kind="info", confirm=None, confirm_text="Confirm"):
+        colors = {"info": "#2b3a4a", "warn": "#4a3a1c", "danger": "#4a2222"}
+        self.setStyleSheet(f"QFrame#notice{{background:{colors.get(kind, colors['info'])};border:1px solid rgba(255,255,255,40);"
+                           f"border-radius:9px}} QLabel{{color:#f2f0ea;font-size:12px}}")
+        self.text.setText(text)
+        self._cb = confirm
+        self.yes.setText(confirm_text)
+        self.yes.setVisible(confirm is not None); self.no.setVisible(confirm is not None)
+        self.close_b.setVisible(confirm is None)
+        self.show(); self.raise_()
+        if confirm is None:
+            self.timer.start(4500)
+        else:
+            self.timer.stop()
+
+
 class HotkeyEdit(QPushButton):
     """Click, then press a key combination. Esc cancels, Backspace clears."""
     changed = Signal(str)
+    problem = Signal(str)
 
     def __init__(self, text):
         super().__init__(text or "Not set")
@@ -91,8 +157,9 @@ class HotkeyEdit(QPushButton):
         if m & Qt.AltModifier: mods.add(0x12)
         if m & Qt.MetaModifier: mods.add(0x5B)
         if not mods:
-            QMessageBox.information(self, "Hotkey", "Use at least one of Ctrl, Shift or Alt so the hotkey doesn't clash with driving controls.")
-            self.setText(self.value or "Not set"); return
+            self.setText(self.value or "Not set")
+            self.problem.emit("Hold Ctrl, Shift or Alt with the key, so the hotkey doesn't clash with driving controls. Click the box to try again.")
+            return
         txt = S.hotkey_text(mods, vk)
         self.value = txt; self.setText(txt); self.changed.emit(txt)
 
@@ -111,7 +178,7 @@ class ColorButton(QPushButton):
         self.setStyleSheet(f"background:{self.color}; border:1px solid #555; border-radius:5px;")
 
     def pick(self):
-        c = QColorDialog.getColor(QColor(self.color), self, "Pick colour")
+        c = pick_color(self.window(), self.color)
         if c.isValid():
             self.color = c.name(); self._paint(); self.changed.emit(self.color)
 
@@ -149,7 +216,11 @@ class SettingsWindow(QDialog):
                     f"<div style='font-size:11px;color:#8d8b84'>for SnowRunner · v{VERSION}</div>")
         tt.setTextFormat(Qt.RichText); bh.addWidget(tt, 1)
         sv.addWidget(brand); sv.addWidget(self.nav, 1)
-        root.addWidget(side); root.addWidget(self.pages, 1)
+        right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0); rv.setSpacing(0)
+        self.notice = Notice(right)
+        nwrap = QWidget(); nl = QVBoxLayout(nwrap); nl.setContentsMargins(20, 12, 20, 0); nl.addWidget(self.notice)
+        rv.addWidget(nwrap); rv.addWidget(self.pages, 1)
+        root.addWidget(side); root.addWidget(right, 1)
         self._save_timer = QTimer(self); self._save_timer.setSingleShot(True); self._save_timer.timeout.connect(lambda: S.save(self.s))
         for title, build in (("General", self.p_general), ("Minimap", self.p_overlay), ("Map & markers", self.p_map),
                              ("Big map", self.p_big), ("Hotkeys", self.p_hotkeys), ("Updates", self.p_updates),
@@ -231,7 +302,7 @@ class SettingsWindow(QDialog):
         def auto(x):
             ok = S.set_autostart(x); self.set("start_with_windows", x)
             if x and not ok:
-                QMessageBox.warning(self, "Startup", "Could not register with Windows startup (only works for the installed app).")
+                self.notice.show_msg("Couldn't register with Windows startup. This only works in the installed app.", "warn")
         c.toggled.connect(auto); f.addRow(c)
         self.combo(f, "Show the minimap", "show_mode", [("game", "Only while SnowRunner is running"), ("always", "Always")])
         self.check(f, "Hide while not driving (garage, menus)", "hide_when_not_driving")
@@ -297,8 +368,8 @@ class SettingsWindow(QDialog):
         self.hint(f, "Maps are drawn from your SnowRunner files the first time you visit a region (about a minute) and kept in the data folder.")
 
     def _clear_maps(self):
-        if QMessageBox.question(self, "Delete maps", "Delete every drawn map? They will be drawn again when needed.") == QMessageBox.Yes:
-            self.action.emit("clear_maps")
+        self.notice.show_msg("Delete every drawn map? They'll be drawn again when needed (about a minute per region).",
+                             "danger", confirm=lambda: self.action.emit("clear_maps"), confirm_text="Delete maps")
 
     def p_big(self, v):
         f = self.group(v, "Big map")
@@ -313,6 +384,7 @@ class SettingsWindow(QDialog):
         for i, (k, label, default) in enumerate(S.ACTIONS):
             grid.addWidget(QLabel(label), i, 0)
             e = HotkeyEdit(self.s["hotkeys"].get(k, default)); e.changed.connect(lambda t, k=k: self._set_hk(k, t))
+            e.problem.connect(lambda m: self.notice.show_msg(m, "warn"))
             grid.addWidget(e, i, 1); self._hk[k] = e
         b = QPushButton("Restore default hotkeys"); b.clicked.connect(self._reset_hk); v.addWidget(b, 0, Qt.AlignLeft)
         l = QLabel("Click a box and press the new combination. Esc cancels, Backspace clears."); l.setObjectName("hint"); v.addWidget(l)
@@ -320,7 +392,8 @@ class SettingsWindow(QDialog):
     def _set_hk(self, k, t):
         for other, val in self.s["hotkeys"].items():
             if other != k and val and val == t:
-                QMessageBox.warning(self, "Hotkey in use", f"{t} is already used. Pick another combination.")
+                name = next((lab for kk, lab, _ in S.ACTIONS if kk == other), other)
+                self.notice.show_msg(f"{t} is already used for \"{name}\". Pick another combination.", "warn")
                 self._hk[k].value = self.s["hotkeys"][k]; self._hk[k].setText(self.s["hotkeys"][k] or "Not set"); return
         self.set("hotkeys", t, k)
 
@@ -358,15 +431,15 @@ class SettingsWindow(QDialog):
         e.editingFinished.connect(lambda: self.set(key, e.text().strip()))
         b = QPushButton("Browse…")
         def browse():
-            d = QFileDialog.getExistingDirectory(self, label, e.text() or os.path.expanduser("~"))
+            d = pick_folder(self.window(), label, e.text() or os.path.expanduser("~"))
             if d:
                 e.setText(d); self.set(key, d)
         b.clicked.connect(browse)
         h.addWidget(e, 1); h.addWidget(b); f.addRow(label, row)
 
     def _reset_all(self):
-        if QMessageBox.question(self, "Reset", "Reset every setting to its default?") == QMessageBox.Yes:
-            self.action.emit("reset")
+        self.notice.show_msg("Reset every setting, including hotkeys, to its default?", "danger",
+                             confirm=lambda: self.action.emit("reset"), confirm_text="Reset settings")
 
     def p_about(self, v):
         ip = os.path.join(paths.APP_DIR, "assets", "icon.png")

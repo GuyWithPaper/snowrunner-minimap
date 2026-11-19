@@ -837,6 +837,7 @@ class Overlay(QWidget):
 
     def poll_keys(self):
         if self.settings_win is not None and self.settings_win.recording:
+            self._esc = True                         # Esc used to cancel a recording must not also close settings
             return                                   # don't fire while the user is recording a hotkey
         down = lambda vk: u32.GetAsyncKeyState(vk) & 0x8000
         held = frozenset(v for v in (0x11, 0x10, 0x12, 0x5B) if down(v))
@@ -984,21 +985,29 @@ class Overlay(QWidget):
         elif r == a_clr:
             self.waypoint.pop(lv, None)
         elif r == a_pin:
-            label, ok = QInputDialog.getText(self, "Add pin", "Name (optional):")
+            label, ok = self._ask_text("Add pin", "Name (optional):")
             if ok:
                 self.pins.setdefault(lv, []).append({"x": wx, "z": wz, "label": label.strip(), "color": "#5AC8FF"})
                 self._save_pins()
         elif pin and r == a_ren:
-            label, ok = QInputDialog.getText(self, "Rename pin", "Name:", text=pin.get("label", ""))
+            label, ok = self._ask_text("Rename pin", "Name:", pin.get("label", ""))
             if ok:
                 pin["label"] = label.strip(); self._save_pins()
         elif pin and r == a_col:
-            c = QColorDialog.getColor(QColor(pin.get("color", "#5AC8FF")), self, "Pin colour")
+            from settingswin import pick_color
+            c = pick_color(self, pin.get("color", "#5AC8FF"), "Pin colour")
             if c.isValid():
                 pin["color"] = c.name(); self._save_pins()
         elif pin and r == a_del:
             self.pins[lv].remove(pin); self._save_pins()
         self.update()
+
+    def _ask_text(self, title, label, text=""):
+        from settingswin import on_top
+        d = QInputDialog(self); d.setWindowTitle(title); d.setLabelText(label); d.setTextValue(text)
+        on_top(d)
+        ok = bool(d.exec())
+        return d.textValue(), ok
 
     def mouseMoveEvent(self, e):
         if self.drag is None:
