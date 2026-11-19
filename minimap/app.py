@@ -57,6 +57,8 @@ class MapStore(QObject):
         self.color, self.meta, self.images, self.fog_sig = {}, {}, {}, {}
         self.busy = set()
         self.lock = threading.Lock()
+        self.drawing_now = None
+        self.drawing_since = 0.0
 
     def path(self, lv):
         return os.path.join(maprender.OUT, lv + ".jpg")
@@ -81,8 +83,12 @@ class MapStore(QObject):
     def _load(self, lv, force):
         try:
             if force or not self.up_to_date(lv):
-                self.status.emit(f"Drawing the map of {levels.display_name(lv)} from your game files (about a minute)…")
-                maprender.build(lv, px_per_m=self.quality, log=log)
+                self.status.emit(f"Drawing the map of {levels.display_name(lv)} from your game files…")
+                self.drawing_now = lv; self.drawing_since = time.time()
+                ok = run_render(lv, self.quality)
+                self.drawing_now = None
+                if not ok:
+                    raise RuntimeError("render process failed")
             from PIL import Image
             img = np.asarray(Image.open(self.path(lv)).convert("RGB")).copy()
             with self.lock:
@@ -276,6 +282,10 @@ class Overlay(QWidget):
             return
         try:
             visited = savedata.complete_save(self.save_dir).get("visitedLevels", [])
+            # let the region you're in load first
+            t0 = time.time()
+            while time.time() - t0 < 120 and (self.level is None or self.level not in self.store.color):
+                time.sleep(1)
             for lv in [(v if v.startswith("level_") else "level_" + v).lower() for v in visited]:
                 if lv in self.detector.info and not self.store.up_to_date(lv):
                     while self.store.busy:
@@ -283,7 +293,7 @@ class Overlay(QWidget):
                     if not self.s["prerender_visited"]:
                         return
                     log("pre-drawing", lv)
-                    maprender.build(lv, px_per_m=self.store.quality, log=log)
+                    run_render(lv, self.store.quality, background=True)
         except Exception:
             log("prerender", traceback.format_exc())
 
@@ -1303,6 +1313,18 @@ class Overlay(QWidget):
         if st is not None and self.s["show_coords"]:
             extra.append(f"{st.x:.0f}, {st.z:.0f}")
         status = self.status or ("Preparing map…" if lv and not have_map else "")
+        prog = None
+        dl = self.store.drawing_now
+        if dl and not have_map:
+            frac, left = render_eta(dl, self.store.drawing_since)
+            mins, secs = divmod(int(round(left)), 60)
+            left_txt = f"about {mins} min {secs:02d} s left" if mins else f"about {secs} s left"
+            status = f"Preparing the map of {levels.display_name(dl)}\n{left_txt}"
+            prog = frac
+            if not getattr(self, "_eta_timer", None):
+                self._eta_timer = QTimer(self); self._eta_timer.timeout.connect(self.update); self._eta_timer.start(250)
+        elif getattr(self, "_eta_timer", None):
+            self._eta_timer.stop(); self._eta_timer = None
         hk = self.s["hotkeys"]
         if self.big and self.view == "settings":
             return
@@ -1330,7 +1352,7 @@ class Overlay(QWidget):
             hb = QRectF(W / 2 - hw / 2 - 14, H - 38, hw + 28, 24)
             self._pill(p, hb, alpha=190); p.setPen(QColor(215, 215, 210)); p.drawText(hb, Qt.AlignCenter, hint)
             if status:
-                self._status(p, W / 2, H / 2, status)
+                self._status(p, W / 2, H / 2, status, progress=prog)
             return
         # minimap: name + speed pill under the dial
         if name or extra:
@@ -1346,20 +1368,28 @@ class Overlay(QWidget):
             p.setFont(self._font(9)); p.setPen(QColor(self.s["arrow_color"]))
             p.drawText(QRectF(box.x() + 12 + nw + gap, box.y(), ew + 4, 22), Qt.AlignVCenter | Qt.AlignLeft, ex)
         if status:
-            self._status(p, cx, cy, status, max_w=D - 60)
+            self._status(p, cx, cy, status, max_w=D - 60, progress=prog)
         if not self.locked:
             p.setFont(self._font(7)); msg = f"Move mode: drag · wheel resizes · {hk.get('unlock')} locks"
             mw = p.fontMetrics().horizontalAdvance(msg)
             box = QRectF(cx - mw / 2 - 10, self.BEZEL + 18, mw + 20, 18); self._pill(p, box, alpha=220)
             p.setPen(QColor(120, 210, 255)); p.drawText(box, Qt.AlignCenter, msg)
 
-    def _status(self, p, x, y, text, max_w=420):
+    def _status(self, p, x, y, text, max_w=420, progress=None):
         p.setFont(self._font(9))
         fm = p.fontMetrics()
         r = fm.boundingRect(0, 0, int(max_w), 200, Qt.AlignCenter | Qt.TextWordWrap, text)
-        box = QRectF(x - r.width() / 2 - 14, y - r.height() / 2 - 9, r.width() + 28, r.height() + 18)
+        bar = 14 if progress is not None else 0
+        bw = max(r.width(), 170 if progress is not None else 0)
+        box = QRectF(x - bw / 2 - 14, y - (r.height() + bar) / 2 - 9, bw + 28, r.height() + bar + 18)
         self._pill(p, box, radius=10, alpha=225)
-        p.setPen(QColor(240, 240, 235)); p.drawText(box, Qt.AlignCenter | Qt.TextWordWrap, text)
+        p.setPen(QColor(240, 240, 235))
+        p.drawText(QRectF(box.x(), box.y() + 7, box.width(), r.height() + 4), Qt.AlignCenter | Qt.TextWordWrap, text)
+        if progress is not None:
+            track = QRectF(box.x() + 14, box.bottom() - 15, box.width() - 28, 5)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 40)); p.drawRoundedRect(track, 2.5, 2.5)
+            fill = QRectF(track.x(), track.y(), track.width() * max(0.02, min(1.0, progress)), track.height())
+            p.setBrush(QColor(self.s["arrow_color"])); p.drawRoundedRect(fill, 2.5, 2.5)
 
     def draw_markers(self, p, lv, t, clip, zoom):
         mk = self.markers.get(lv)
@@ -1423,7 +1453,94 @@ class Overlay(QWidget):
         return e
 
 
+def render_cli(argv):
+    """MapRunner.exe --render <level> <px_per_m>: draw one region and exit (runs as a child process)."""
+    lv, q = argv[0], float(argv[1]) if len(argv) > 1 else 3.0
+    t0 = time.time()
+    marks = (("plant instances", 0.05), ("ground layer colours", 0.15), ("using the game's baked", 0.27),
+             ("water:", 0.40), ("vegetation", 0.41), ("footprints", 0.50), ("landmark meshes", 0.92), ("done in", 1.0))
+    def plog(msg):
+        log(msg)
+        for key, frac in marks:
+            if key in msg:
+                write_progress(lv, frac, time.time() - t0)
+    write_progress(lv, 0.0, 0.0)
+    try:
+        maprender.build(lv, px_per_m=q, log=plog)
+        save_render_time(time.time() - t0)
+        return 0
+    except Exception:
+        log("render failed", lv, traceback.format_exc())
+        return 1
+
+
+PROGRESS = os.path.join(paths.DATA, "render_progress.json")
+STATS = os.path.join(paths.DATA, "render_stats.json")
+
+
+def write_progress(level, frac, elapsed):
+    try:
+        with open(PROGRESS + ".tmp", "w") as f:
+            json.dump({"level": level, "frac": frac, "elapsed": elapsed, "t": time.time()}, f)
+        os.replace(PROGRESS + ".tmp", PROGRESS)
+    except Exception:
+        pass
+
+
+def save_render_time(sec):
+    try:
+        st = json.load(open(STATS)) if os.path.exists(STATS) else {}
+        hist = (st.get("times") or [])[-4:] + [round(sec, 1)]
+        json.dump({"times": hist}, open(STATS, "w"))
+    except Exception:
+        pass
+
+
+def typical_render_time():
+    try:
+        t = json.load(open(STATS)).get("times") or []
+        if t:
+            return float(np.median(t))
+    except Exception:
+        pass
+    return 60.0
+
+
+def render_eta(level, started):
+    """(fraction 0..1, seconds left) for a region being drawn, from the child's progress marks."""
+    now = time.time()
+    expected = typical_render_time()
+    frac, el = 0.0, now - started
+    try:
+        p = json.load(open(PROGRESS))
+        if p.get("level") == level and p.get("t", 0) >= started - 1:
+            frac = float(p["frac"])
+            if frac > 0.04 and p["elapsed"] > 1:
+                expected = 0.5 * expected + 0.5 * (p["elapsed"] / frac)
+    except Exception:
+        pass
+    frac = max(frac, min(0.97, el / max(expected, 1)))          # smooth between marks
+    return frac, max(1.0, expected - el)
+
+
+def run_render(level, quality, background=False):
+    """Draw a region in a child process; returns True on success. Background ones run at low priority."""
+    import subprocess
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--render", level, str(quality)]
+    else:
+        cmd = [sys.executable, os.path.abspath(__file__), "--render", level, str(quality)]
+    flags = 0x08000000 | (0x00004000 if background else 0)      # CREATE_NO_WINDOW | BELOW_NORMAL priority
+    try:
+        return subprocess.run(cmd, creationflags=flags).returncode == 0
+    except Exception:
+        log("render process failed", traceback.format_exc())
+        return False
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--render":
+        sys.exit(render_cli(sys.argv[2:]))
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MapRunner")
     mtx = ctypes.windll.kernel32.CreateMutexW(None, False, "MapRunner_single_instance")

@@ -118,15 +118,16 @@ def render_ground(z, level, stg, baked, half_x, half_z, px_per_m, size, log=prin
         pass
         log("  ground layer colours from baked map: " + ", ".join(f"{nm}={tuple(int(v) for v in c)}" for (nm, _), c in zip(common, cols)))
     out = np.zeros((H, W, 3), np.float32)
-    ys, xs = np.mgrid[0:H, 0:W]
+    wts_n = wts_n.astype(np.float32)
     s1 = 1 - np.clip(wts_n.sum(-1, keepdims=True), 0, 1)
     for li, t in enumerate(texs):
         n = t.shape[0]
-        grain = t[ys % n, xs % n] - tmeans[li]
-        base = cols[li] if cols is not None else tmeans[li]
+        base = (cols[li] if cols is not None else tmeans[li]).astype(np.float32)
+        tile = (t - tmeans[li] + base).astype(np.float32)
+        layer = np.tile(tile, (H // n + 1, W // n + 1, 1))[:H, :W]        # repeat the texture (fast copy)
         w = s1 if li == 0 else wts_n[..., li - 1:li]
-        out += (base + grain) * w
-    del ys, xs
+        out += layer * w
+        del layer
 
     # match colours to the game's baked map at a ~6 m scale (keeps detail sharp, colours correct)
     if baked is not None:

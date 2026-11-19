@@ -460,6 +460,37 @@ def mesh_triangles(lmk_name):
     return res
 
 
+def quat_yaw(q):
+    R = quat_matrix(q)
+    return float(np.degrees(np.arctan2(R[0, 2], R[2, 2])))
+
+
+def tree_sprite(tris, cols, yaw_deg, sc, px_per_m, sun):
+    """Render one tree model (rotated, scaled, lit like the map) to an RGBA sprite + shadow mask, once."""
+    a = np.radians(yaw_deg); c, s = np.cos(a), np.sin(a)
+    R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float32)
+    w = (tris.reshape(-1, 3) @ R.T * sc).reshape(-1, 3, 3)
+    nrm = np.cross(w[:, 1] - w[:, 0], w[:, 2] - w[:, 0])
+    ln = np.linalg.norm(nrm, axis=1, keepdims=True); ln[ln == 0] = 1; nrm /= ln
+    nrm[nrm[:, 1] < 0] *= -1
+    shade = tonemap_lmk(cols, np.clip(nrm @ sun, 0, 1).astype(np.float32), np.clip(nrm[:, 1], 0, 1).astype(np.float32))
+    top = w[:, :, 1].max(1); hgt = np.clip(top, 0, 30)
+    px = w[:, :, 0] * px_per_m; pz = w[:, :, 2] * px_per_m
+    off = hgt * px_per_m
+    x0 = int(np.floor(px.min())) - 2; z0 = int(np.floor(pz.min())) - 2
+    x1 = int(np.ceil(max(px.max(), (px.max(1) + off).max()))) + 2; z1 = int(np.ceil(pz.max())) + 2
+    Wd, Hd = max(1, x1 - x0), max(1, z1 - z0)
+    if Wd * Hd > 600 * 600:
+        return None
+    img = Image.new("RGBA", (Wd, Hd), (0, 0, 0, 0)); shd = Image.new("L", (Wd, Hd), 0)
+    di = ImageDraw.Draw(img); ds = ImageDraw.Draw(shd)
+    for k in np.argsort(top):
+        pts = [(px[k, j] - x0, pz[k, j] - z0) for j in range(3)]
+        ds.polygon([(u + off[k], v) for u, v in pts], fill=255)
+        di.polygon(pts, fill=tuple(int(v) for v in shade[k]) + (255,))
+    return img, shd, x0, z0, float(top.max())
+
+
 def quat_matrix(q):
     x, y, z, w = (float(v) for v in q)
     return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
@@ -529,6 +560,8 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
     sun = -np.array([1.0, -1.0, 0.0]); sun /= np.linalg.norm(sun)
     flat_light = SUN_COL.mean() * 0.7 + AMB_UP.mean()
     all_polys = []
+    stamps = []
+    sprites = {}
     n_inst = 0
     fitted = [0]
     skipped = [0]
@@ -553,6 +586,18 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
         fittable = occ is not None and not is_plant and "bridge" not in name.lower() and ext[1] > 2.5 and ext[0] * ext[2] > 25
         for p in arr:
             x, y, z, sc = p[:4]
+            if is_plant:
+                yaw = quat_yaw(p[4:8]) if len(p) >= 8 else 0.0
+                key = (name, int(round(yaw / 45.0)) % 8, round(float(sc) * 10) / 10)
+                spr = sprites.get(key)
+                if spr is None:
+                    spr = sprites[key] = tree_sprite(tris, cols, key[1] * 45.0, key[2], px_per_m, sun)
+                if spr is not None:
+                    img, shd, ox, oy, top_rel = spr
+                    px0 = (x + half_x) * px_per_m + ox; pz0 = (z + half_z) * px_per_m + oy
+                    stamps.append((y + top_rel, int(round(px0)), int(round(pz0)), key))
+                    n_inst += 1
+                continue
             R = quat_matrix(p[4:8]) if len(p) >= 8 else np.eye(3, dtype=np.float32)
             w = tris.reshape(-1, 3) @ R.T * sc + np.array([x, y, z], np.float32)
             w = w.reshape(-1, 3, 3)
@@ -579,13 +624,24 @@ def draw_landmark_meshes(lmk, canvas, flatmask, shadow, half_x, half_z, px_per_m
             for k in range(len(w)):
                 all_polys.append((top[k], px[k], pz[k], shade[k], hgt[k]))
             n_inst += 1
-    all_polys.sort(key=lambda t: t[0])
-    for top, px, pz, col, hgt in all_polys:
-        pts = list(zip(px.tolist(), pz.tolist()))
-        off = hgt * px_per_m          # sun at 45 degrees from -x: shadow length = height
-        sd.polygon([(a + off, b) for a, b in pts], fill=170)
-        cd.polygon(pts, fill=tuple(int(c) for c in col))
-        md.polygon(pts, fill=255)
+    # draw everything back to front by height: tree sprites and exact building/prop triangles interleaved
+    items = [(t[0], 0, i) for i, t in enumerate(all_polys)] + [(s[0], 1, i) for i, s in enumerate(stamps)]
+    items.sort(key=lambda t: t[0])
+    for _, kind, i in items:
+        if kind == 0:
+            top, px, pz, col, hgt = all_polys[i]
+            pts = list(zip(px.tolist(), pz.tolist()))
+            off = hgt * px_per_m          # sun at 45 degrees from -x: shadow length = height
+            sd.polygon([(a + off, b) for a, b in pts], fill=170)
+            cd.polygon(pts, fill=tuple(int(c) for c in col))
+            md.polygon(pts, fill=255)
+        else:
+            _, x0, y0, key = stamps[i]
+            img, shd, ox, oy, _t = sprites[key]
+            a = img.getchannel("A")
+            shadow.paste(170, (x0, y0), shd)
+            canvas.paste(img, (x0, y0), a)
+            flatmask.paste(255, (x0, y0), a)
     log(f"  drew {n_inst} landmark meshes ({len(all_polys)} triangles); {fitted[0]} large ones aligned to the game's footprints, {skipped[0]} replaced by footprints")
 
 
