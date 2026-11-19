@@ -12,6 +12,7 @@ from version import VERSION, REPO
 
 STYLE = """
 QDialog, QWidget#page { background: #16191c; color: #e4e1d8; }
+QDialog#card { background: #16191c; border: 1px solid #2c3136; border-radius: 14px; }
 QLabel { color: #e4e1d8; }
 QLabel#h1 { font-size: 18px; font-weight: 600; color: #ffffff; }
 QLabel#hint { color: #9a9890; font-size: 11px; }
@@ -119,11 +120,17 @@ class SettingsWindow(QDialog):
     changed = Signal(str)          # key that changed
     action = Signal(str)           # buttons that ask the app to do something
 
-    def __init__(self, s, parent=None):
+    def __init__(self, s, parent=None, embedded=False):
         super().__init__(parent)
         self.s = s
+        self.embedded = embedded
         self.setWindowTitle("Map Runner — Settings")
-        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
+        if embedded:
+            self.setWindowFlags(Qt.Widget)
+            self.setObjectName("card")
+            self.setAttribute(Qt.WA_StyledBackground, True)
+        else:
+            self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint)
         ip = os.path.join(paths.APP_DIR, "assets", "icon.ico")
         if os.path.exists(ip):
             self.setWindowIcon(QIcon(ip))
@@ -151,9 +158,14 @@ class SettingsWindow(QDialog):
             self.pages.addWidget(self._page(title, build))
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.nav.setCurrentRow(0)
-        dark_title_bar(self)
+        if not embedded:
+            dark_title_bar(self)
 
     # ---------- helpers
+    @property
+    def recording(self):
+        return any(e.listening for e in getattr(self, "_hk", {}).values())
+
     def _page(self, title, build):
         w = QWidget(); w.setObjectName("page")
         v = QVBoxLayout(w); v.setContentsMargins(28, 22, 28, 22); v.setSpacing(6)
@@ -355,7 +367,6 @@ class SettingsWindow(QDialog):
     def _reset_all(self):
         if QMessageBox.question(self, "Reset", "Reset every setting to its default?") == QMessageBox.Yes:
             self.action.emit("reset")
-            self.close()
 
     def p_about(self, v):
         ip = os.path.join(paths.APP_DIR, "assets", "icon.png")

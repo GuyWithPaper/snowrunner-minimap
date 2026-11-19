@@ -11,12 +11,12 @@ if _boot.get("game_dir"):
     os.environ["SNOWRUNNER_DIR"] = _boot["game_dir"]
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QObject, QPoint
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, Signal, QObject, QPoint, QPropertyAnimation, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (QImage, QPainter, QPainterPath, QColor, QPen, QFont, QPolygonF, QTransform,
                            QGuiApplication, QIcon, QAction, QCursor, QBrush, QRadialGradient, QLinearGradient)
 from PySide6.QtWidgets import (QApplication, QWidget, QSystemTrayIcon, QMenu, QMessageBox, QDialog, QVBoxLayout, QLabel,
                                QPushButton, QHBoxLayout, QInputDialog, QColorDialog, QLineEdit, QListWidget,
-                               QListWidgetItem)
+                               QListWidgetItem, QGraphicsOpacityEffect)
 
 import reader as rd, levels, maprender, savedata, updater, icons
 from settingswin import SettingsWindow, STYLE, dark_title_bar
@@ -183,6 +183,10 @@ class Overlay(QWidget):
     def __init__(self):
         super().__init__()
         self.pending_update = None
+        self.view = "map"            # big-mode content: "map" | "settings"
+        self._from_mini = False      # settings opened from the minimap (closing returns there)
+        self._dim = 0.0              # 0 = map, 1 = settings (animated)
+        self._anims = []
         self.sig_update.connect(self._on_update_ready)
         self.sig_notify.connect(lambda m: self.notify(m, force=True))
         self.s = S.load()
@@ -229,6 +233,7 @@ class Overlay(QWidget):
         self.t_upd.start(int(self.s["update_hours"]) * 3600 * 1000)
         self.make_tray()
         self._build_search()
+        self._build_tabs()
         try:
             import gameicons
             icons.set_glyphs(gameicons.load(maprender.PAKS))
@@ -327,14 +332,171 @@ class Overlay(QWidget):
         return c[1]
 
     # ---------- settings
-    def open_settings(self):
+    # ---------- settings: a view inside the overlay, not a separate window
+    def _ensure_settings(self):
         if self.settings_win is None:
-            self.settings_win = SettingsWindow(self.s)
+            self.settings_win = SettingsWindow(self.s, parent=self, embedded=True)
             self.settings_win.changed.connect(self.on_setting)
             self.settings_win.action.connect(self.on_action)
-            self.settings_win.finished.connect(lambda _: setattr(self, "settings_win", None))
-        self.settings_win.show(); self.settings_win.raise_(); self.settings_win.activateWindow()
-        self.refresh_visibility()
+            self._fx = QGraphicsOpacityEffect(self.settings_win); self._fx.setOpacity(0.0)
+            self.settings_win.setGraphicsEffect(self._fx)
+            self.settings_win.hide()
+        return self.settings_win
+
+    def open_settings(self):
+        if self._busy():
+            return
+        if self.big and self.view == "settings":
+            self.close_settings(); return              # hotkey toggles
+        self._ensure_settings()
+        if not self.big:
+            self._from_mini = True
+            self._window_transition(lambda: self._enter_big(view="settings"))
+        else:
+            self._from_mini = False
+            self._switch_view("settings")
+
+    def close_settings(self):
+        if self._busy() or self.view != "settings":
+            return
+        if self._from_mini:
+            self._window_transition(self._leave_big)
+        else:
+            self._switch_view("map")
+
+    def _toggle_view(self, v):
+        if v == "settings":
+            self._ensure_settings(); self._switch_view("settings")
+        else:
+            self._switch_view("map")
+
+    # ---------- animation helpers
+    def _busy(self):
+        return any(a.state() == a.State.Running for a in self._anims)
+
+    def _keep(self, a):
+        self._anims = [x for x in self._anims if x.state() == x.State.Running] + [a]
+        return a
+
+    def _target_opacity(self):
+        if self.big and self.view == "settings":
+            return 1.0
+        return float(self.s["big_opacity"] if self.big else self.s["opacity"])
+
+    def _window_transition(self, change):
+        """Fade the overlay out, change size/mode, fade back in (smooth instead of a jump)."""
+        out = self._keep(QPropertyAnimation(self, b"windowOpacity"))
+        out.setDuration(110); out.setStartValue(self.windowOpacity()); out.setEndValue(0.0)
+        out.setEasingCurve(QEasingCurve.InCubic)
+        def after():
+            change()
+            QTimer.singleShot(16, lambda: self._fade_in())
+        out.finished.connect(after)
+        if not self.isVisible():
+            self.setWindowOpacity(0.0); after()
+        else:
+            out.start()
+
+    def _fade_in(self):
+        a = self._keep(QPropertyAnimation(self, b"windowOpacity"))
+        a.setDuration(190); a.setStartValue(0.0); a.setEndValue(self._target_opacity())
+        a.setEasingCurve(QEasingCurve.OutCubic); a.start()
+
+    def _switch_view(self, v):
+        """Cross-fade between the big map and settings inside the same window."""
+        if v == self.view:
+            return
+        self.view = v
+        start, end = self._dim, (1.0 if v == "settings" else 0.0)
+        if v == "settings":
+            self._layout_search()
+            self.settings_win.show(); self.settings_win.raise_()
+            self._focus_self()
+        a = self._keep(QVariantAnimation(self))
+        a.setDuration(220); a.setStartValue(start); a.setEndValue(end); a.setEasingCurve(QEasingCurve.OutCubic)
+        def step(x):
+            self._dim = float(x)
+            if self.settings_win is not None:
+                self._fx.setOpacity(self._dim)
+            self.update()
+        a.valueChanged.connect(step)
+        def done():
+            if self.view == "map" and self.settings_win is not None:
+                self.settings_win.hide()
+            self._layout_search(); self._update_tabs()
+        a.finished.connect(done)
+        self.setWindowOpacity(self._target_opacity())
+        self._update_tabs(); self._layout_search()
+        a.start()
+
+    def _focus_self(self):
+        self.set_click_through()
+        self.raise_(); self.activateWindow()
+        try:
+            u32.SetForegroundWindow(int(self.winId()))
+        except Exception:
+            pass
+
+    def _enter_big(self, view="map"):
+        self._prev_fg = u32.GetForegroundWindow()
+        self.big = True; self.pan = None
+        self.big_zoom = None if self.s["big_view"] == "whole" else self.s["big_zoom"]
+        self.view = view
+        self._dim = 1.0 if view == "settings" else 0.0
+        if self.settings_win is not None:
+            self._fx.setOpacity(self._dim)
+            self.settings_win.setVisible(view == "settings")
+        self.apply_geometry(); self.refresh_visibility(); self.set_click_through()
+        self._layout_search(); self._update_tabs(); self.update()
+        if view == "settings":
+            self._focus_self()
+
+    def _leave_big(self):
+        self.big = False; self.pan = None; self.view = "map"; self._dim = 0.0
+        if self.settings_win is not None:
+            self.settings_win.hide(); self._fx.setOpacity(0.0)
+        self.search.clear(); self.search.clearFocus()
+        self.apply_geometry(); self.refresh_visibility(); self.set_click_through()
+        self._layout_search(); self._update_tabs(); self.update()
+        if getattr(self, "_prev_fg", None):
+            u32.SetForegroundWindow(self._prev_fg)        # hand the keyboard back to the game
+
+    # ---------- big-mode tab bar (Map | Settings | close)
+    def _build_tabs(self):
+        css = ("QPushButton{background:rgba(16,19,22,215);color:#d8d6cf;border:1px solid rgba(255,255,255,30);"
+               "padding:6px 16px;font-size:12px;font-weight:600}"
+               "QPushButton:checked{background:#ffc400;color:#16181a;border-color:#ffc400}"
+               "QPushButton:hover:!checked{background:rgba(40,45,50,230)}")
+        self.tab_map = QPushButton("Map", self); self.tab_set = QPushButton("Settings", self)
+        self.tab_close = QPushButton("✕", self)
+        for b, r in ((self.tab_map, "border-top-left-radius:15px;border-bottom-left-radius:15px;border-right:none"),
+                     (self.tab_set, "border-top-right-radius:15px;border-bottom-right-radius:15px")):
+            b.setCheckable(True); b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(css.replace("font-weight:600}", "font-weight:600;" + r + "}"))
+        self.tab_close.setCursor(Qt.PointingHandCursor)
+        self.tab_close.setStyleSheet("QPushButton{background:rgba(16,19,22,215);color:#d8d6cf;border:1px solid rgba(255,255,255,30);"
+                                     "border-radius:15px;font-size:13px}QPushButton:hover{background:#c0392b;color:white}")
+        self.tab_map.clicked.connect(lambda: self._toggle_view("map"))
+        self.tab_set.clicked.connect(lambda: self._toggle_view("settings"))
+        self.tab_close.clicked.connect(lambda: self._window_transition(self._leave_big))
+        for b in (self.tab_map, self.tab_set, self.tab_close):
+            b.hide()
+
+    def _update_tabs(self):
+        if not hasattr(self, "tab_map"):
+            return
+        show = self.big
+        for b in (self.tab_map, self.tab_set, self.tab_close):
+            b.setVisible(show)
+        if not show:
+            return
+        self.tab_map.setChecked(self.view == "map"); self.tab_set.setChecked(self.view == "settings")
+        W = self.width()
+        tw = 96
+        self.tab_map.setGeometry(int(W / 2 - tw), 14, tw, 30); self.tab_set.setGeometry(int(W / 2), 14, tw, 30)
+        self.tab_close.setGeometry(W - 46, 14, 30, 30)
+        for b in (self.tab_map, self.tab_set, self.tab_close):
+            b.raise_()
 
     def on_setting(self, key):
         if key in ("size", "position", "monitor", "shape", "big_size"):
@@ -387,7 +549,13 @@ class Overlay(QWidget):
         elif a == "diagnostics":
             QApplication.clipboard().setText(self.diagnostics()); self.notify("Diagnostics copied to the clipboard.", force=True)
         elif a == "reset":
-            self.s.clear(); self.s.update(S.reset()); self.load_hotkeys(); self.apply_geometry(); self.apply_opacity(); self.update_tray(); self.update()
+            self.s.clear(); self.s.update(S.reset()); self.load_hotkeys(); self.apply_opacity(); self.update_tray()
+            if self.settings_win is not None:
+                old = self.settings_win; self.settings_win = None; old.hide(); old.deleteLater()
+                self._ensure_settings()
+                if self.big and self.view == "settings":
+                    self._fx.setOpacity(1.0); self.settings_win.show(); self._layout_search()
+            self.update()
 
     def diagnostics(self):
         st = self.state
@@ -530,7 +698,8 @@ class Overlay(QWidget):
         self.setGeometry(int(x), int(y), sz, h)
 
     def apply_opacity(self):
-        self.setWindowOpacity(float(self.s["big_opacity"] if self.big else self.s["opacity"]))
+        if not self._busy():
+            self.setWindowOpacity(self._target_opacity())
 
     def refresh_visibility(self):
         want = self.s["visible"]
@@ -540,8 +709,6 @@ class Overlay(QWidget):
             want = False
         if not self.locked or self.big:
             want = True
-        if self.settings_win is not None and self.s["visible"]:
-            want = True          # preview while configuring
         if want != self.isVisible():
             self.setVisible(want)
             if want:
@@ -562,11 +729,15 @@ class Overlay(QWidget):
         self._hilite = None
 
     def _layout_search(self):
-        if not self.big:
+        if self.settings_win is not None and self.big:
+            W, H = self.width(), self.height()
+            m = 22
+            self.settings_win.setGeometry(m, 58, W - 2 * m, H - 58 - m)
+        if not self.big or self.view == "settings":
             self.search.hide(); self.results.hide(); return
         W = self.width()
-        w = min(360, int(W * 0.42))
-        self.search.setGeometry(W - w - 16, 12, w, 32); self.search.show()
+        w = min(320, int(W * 0.3))
+        self.search.setGeometry(W - w - 58, 14, w, 30); self.search.show()
         self.results.setGeometry(W - w - 16, 48, w, min(300, self.height() - 80))
         self.results.setVisible(bool(self.search.text().strip()) and self.results.count() > 0)
 
@@ -655,7 +826,7 @@ class Overlay(QWidget):
                     self._binds[(hk[0], 0x6D)] = fn
 
     def poll_keys(self):
-        if self.settings_win is not None and self.settings_win.isActiveWindow():
+        if self.settings_win is not None and self.settings_win.recording:
             return                                   # don't fire while the user is recording a hotkey
         down = lambda vk: u32.GetAsyncKeyState(vk) & 0x8000
         held = frozenset(v for v in (0x11, 0x10, 0x12, 0x5B) if down(v))
@@ -666,8 +837,10 @@ class Overlay(QWidget):
             else:
                 self.keys_down.discard((mods, vk))
         esc = bool(down(0x1B))
-        if self.big and esc and not getattr(self, "_esc", False):   # Esc closes the big map
-            if self.search.hasFocus() and self.search.text():
+        if self.big and esc and not getattr(self, "_esc", False):   # Esc steps back
+            if self.view == "settings":
+                self.close_settings()
+            elif self.search.hasFocus() and self.search.text():
                 self.search.clear()
             else:
                 self.k_big()
@@ -677,23 +850,18 @@ class Overlay(QWidget):
         self.s["visible"] = not self.s["visible"]; S.save(self.s); self.refresh_visibility(); self.update_tray()
 
     def k_big(self):
-        self.big = not self.big
-        self.pan = None
-        if self.big:
-            self._prev_fg = u32.GetForegroundWindow()
-        else:
-            self.search.clear(); self.search.clearFocus()
-            if getattr(self, "_prev_fg", None):
-                u32.SetForegroundWindow(self._prev_fg)     # hand the keyboard back to the game
-        if self.big and self.s["big_view"] == "whole":
-            self.big_zoom = None
+        if self._busy():
+            return
+        if self.big and self.view == "settings":
+            self._from_mini = False
+            self._switch_view("map")                   # big-map hotkey from settings shows the map
         elif self.big:
-            self.big_zoom = self.s["big_zoom"]
-        self.apply_geometry(); self.apply_opacity(); self.refresh_visibility(); self.set_click_through()
-        self._layout_search(); self.update()
+            self._window_transition(self._leave_big)
+        else:
+            self._window_transition(lambda: self._enter_big("map"))
 
     def resizeEvent(self, e):
-        self._layout_search()
+        self._layout_search(); self._update_tabs()
 
     def k_zoom(self, f):
         if self.big:
@@ -720,23 +888,42 @@ class Overlay(QWidget):
 
     # ---------- mouse: move mode on the minimap, pan / zoom / waypoint on the big map
     def _whole_zoom(self):
+        """Zoom at which the region exactly fills the frame (no empty border)."""
         m = self.store.meta.get(self.level)
         if not m:
             return 0.5
-        return min(self.width(), self.height()) / (2 * max(m["half_x"], m["half_z"]))
+        return max(self.width() / (2 * m["half_x"]), self.height() / (2 * m["half_z"]))
+
+    def _clamp_centre(self, fx, fz, zoom, W, H):
+        """Keep the map covering the whole frame (centre it on an axis where it is smaller than the frame)."""
+        m = self.store.meta.get(self.level)
+        if not m:
+            return fx, fz
+        out = []
+        for c, half, px in ((fx, m["half_x"], W), (fz, m["half_z"], H)):
+            vis = px / 2 / zoom
+            out.append(0.0 if vis >= half else min(max(c, -half + vis), half - vis))
+        return out[0], out[1]
 
     def _view(self):
         """(transform world->screen, zoom) for the current frame."""
         W, H = self.width(), self.height()
         st = self.state
         if self.big:
-            zoom = self.big_zoom or self._whole_zoom()
+            # never zoom out past the whole region
+            wz = self._whole_zoom()
+            if self.big_zoom is not None and self.big_zoom < wz:
+                self.big_zoom = None
+            zoom = self.big_zoom or wz
             if self.pan is not None:
                 fx, fz = self.pan
             elif self.big_zoom is None or st is None:
                 fx, fz = 0.0, 0.0
             else:
                 fx, fz = st.x, st.z
+            fx, fz = self._clamp_centre(fx, fz, zoom, W, H)
+            if self.pan is not None:
+                self.pan = (fx, fz)                       # drag stops at the map edge
             cy = H / 2
         else:
             zoom = float(self.s["zoom"]); fx, fz = (st.x, st.z) if st else (0.0, 0.0); cy = W / 2
@@ -747,6 +934,8 @@ class Overlay(QWidget):
         return t, zoom, (fx, fz)
 
     def mousePressEvent(self, e):
+        if self.big and self.view == "settings":
+            return
         if self.big:
             self.results.hide()
             if e.button() == Qt.LeftButton:
@@ -822,6 +1011,8 @@ class Overlay(QWidget):
             self.pan = None; self.update()           # double-click recentres on the truck
 
     def wheelEvent(self, e):
+        if self.big and self.view == "settings":
+            return
         up = e.angleDelta().y() > 0
         if self.big:
             t, z, _ = self._view()
@@ -970,6 +1161,9 @@ class Overlay(QWidget):
                 self.draw_truck(p, t, st, rotate, cx, cy)
             if self.s["show_scale"]:
                 self.draw_scale(p, W, H, D, cx, zoom)
+        if self.big and self._dim > 0:
+            p.save(); p.setClipPath(clip); p.setPen(Qt.NoPen)
+            p.setBrush(QColor(8, 10, 12, int(170 * self._dim))); p.drawPath(clip); p.restore()
         self.draw_frame(p, W, H, D, cx, cy, clip, rotate)
         self.draw_info(p, W, H, D, cx, cy, have_map)
         p.end()
@@ -1110,6 +1304,8 @@ class Overlay(QWidget):
             extra.append(f"{st.x:.0f}, {st.z:.0f}")
         status = self.status or ("Preparing map…" if lv and not have_map else "")
         hk = self.s["hotkeys"]
+        if self.big and self.view == "settings":
+            return
         if self.big:
             # header card
             p.setFont(self._font(15, QFont.Bold)); title = name or "Map Runner"
