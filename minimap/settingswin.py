@@ -79,6 +79,31 @@ def pick_folder(parent, title, start):
     return d.selectedFiles()[0] if d.exec() and d.selectedFiles() else ""
 
 
+SWATCHES = [("Yellow", "#FFC400"), ("Amber", "#FF9F1C"), ("Red", "#E5483B"), ("Pink", "#FF5AD0"),
+            ("Purple", "#9B6BFF"), ("Blue", "#3D8BFF"), ("Sky", "#5AC8FF"), ("Teal", "#2EC4B6"),
+            ("Green", "#5CCB5F"), ("Lime", "#B5E550"), ("White", "#F2F0EA"), ("Sand", "#E6DCBE"),
+            ("Grey", "#8E9399"), ("Black", "#1E2124")]
+
+
+def swatch_menu(parent, current, pos):
+    """Colour choice as a menu of swatches (no dialog window)."""
+    from PySide6.QtGui import QPixmap, QPainter as _P
+    from PySide6.QtWidgets import QMenu
+    m = QMenu(parent)
+    m.setStyleSheet("QMenu{background:#1b1e21;color:#eee;border:1px solid #333;padding:4px}"
+                    "QMenu::item{padding:6px 18px 6px 8px}QMenu::item:selected{background:#3a3f45}")
+    acts = {}
+    for name, hexc in SWATCHES:
+        pm = QPixmap(18, 18); pm.fill(Qt.transparent)
+        q = _P(pm); q.setRenderHint(_P.Antialiasing); q.setBrush(QColor(hexc))
+        q.setPen(QColor(255, 255, 255, 200) if hexc.lower() == str(current).lower() else QColor(0, 0, 0, 120))
+        q.drawRoundedRect(1, 1, 16, 16, 4, 4); q.end()
+        a = m.addAction(QIcon(pm), name + ("   ✓" if hexc.lower() == str(current).lower() else ""))
+        acts[a] = hexc
+    r = m.exec(pos)
+    return acts.get(r)
+
+
 class Notice(QFrame):
     """Message strip shown inside the settings panel (never a popup window)."""
 
@@ -178,9 +203,9 @@ class ColorButton(QPushButton):
         self.setStyleSheet(f"background:{self.color}; border:1px solid #555; border-radius:5px;")
 
     def pick(self):
-        c = pick_color(self.window(), self.color)
-        if c.isValid():
-            self.color = c.name(); self._paint(); self.changed.emit(self.color)
+        c = swatch_menu(self, self.color, self.mapToGlobal(self.rect().bottomLeft()))
+        if c:
+            self.color = c; self._paint(); self.changed.emit(self.color)
 
 
 class SettingsWindow(QDialog):

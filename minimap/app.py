@@ -264,9 +264,17 @@ class Overlay(QWidget):
 
     def first_run(self):
         self.s["first_run_done"] = True; S.save(self.s)
-        r = Welcome(self.s["hotkeys"]).exec()
-        if r == 2:
-            self.open_settings()
+        hk = self.s["hotkeys"]
+        self.open_settings()
+        def welcome():
+            if self.settings_win is not None:
+                self.settings_win.notice.show_msg(
+                    f"Welcome to Map Runner! Start SnowRunner (Borderless or Windowed) and get in a truck. "
+                    f"{hk.get('toggle')} shows or hides the minimap, {hk.get('big')} opens the big map, "
+                    f"{hk.get('settings')} opens these settings. Press Esc to close.", "info",
+                    confirm=lambda: None, confirm_text="Got it")
+                self.settings_win.notice.no.hide()
+        QTimer.singleShot(450, welcome)
 
     def _init_detector(self):
         if not maprender.PAKS:
@@ -849,7 +857,9 @@ class Overlay(QWidget):
                 self.keys_down.discard((mods, vk))
         esc = bool(down(0x1B))
         if self.big and esc and not getattr(self, "_esc", False):   # Esc steps back
-            if self.view == "settings":
+            if self._finish_pin_name(cancel=True):
+                pass
+            elif self.view == "settings":
                 self.close_settings()
             elif self.search.hasFocus() and self.search.text():
                 self.search.clear()
@@ -948,6 +958,7 @@ class Overlay(QWidget):
         if self.big and self.view == "settings":
             return
         if self.big:
+            self._finish_pin_name()
             self.results.hide()
             if e.button() == Qt.LeftButton:
                 t, zoom, c = self._view()
@@ -969,9 +980,18 @@ class Overlay(QWidget):
         a_wp = m.addAction("Set waypoint here")
         a_clr = m.addAction("Clear waypoint") if lv in self.waypoint else None
         m.addSeparator()
-        a_pin = m.addAction("Add pin here...")
-        a_ren = m.addAction("Rename pin...") if pin else None
-        a_col = m.addAction("Pin colour...") if pin else None
+        a_pin = m.addAction("Add pin here")
+        a_ren = m.addAction("Rename pin") if pin else None
+        col_acts = {}
+        if pin:
+            from settingswin import SWATCHES
+            from PySide6.QtGui import QPixmap
+            cm = m.addMenu("Pin colour")
+            cm.setStyleSheet(m.styleSheet())
+            for nm_, hexc in SWATCHES:
+                pm = QPixmap(16, 16); pm.fill(QColor(hexc))
+                col_acts[cm.addAction(QIcon(pm), nm_)] = hexc
+        a_col = None
         a_del = m.addAction("Remove pin") if pin else None
         if self.state is not None:
             m.addSeparator()
@@ -985,29 +1005,40 @@ class Overlay(QWidget):
         elif r == a_clr:
             self.waypoint.pop(lv, None)
         elif r == a_pin:
-            label, ok = self._ask_text("Add pin", "Name (optional):")
-            if ok:
-                self.pins.setdefault(lv, []).append({"x": wx, "z": wz, "label": label.strip(), "color": "#5AC8FF"})
-                self._save_pins()
+            newp = {"x": wx, "z": wz, "label": "", "color": "#5AC8FF"}
+            self.pins.setdefault(lv, []).append(newp); self._save_pins()
+            self._edit_pin_name(newp, e.position())
         elif pin and r == a_ren:
-            label, ok = self._ask_text("Rename pin", "Name:", pin.get("label", ""))
-            if ok:
-                pin["label"] = label.strip(); self._save_pins()
-        elif pin and r == a_col:
-            from settingswin import pick_color
-            c = pick_color(self, pin.get("color", "#5AC8FF"), "Pin colour")
-            if c.isValid():
-                pin["color"] = c.name(); self._save_pins()
+            self._edit_pin_name(pin, e.position())
+        elif pin and r in col_acts:
+            pin["color"] = col_acts[r]; self._save_pins()
         elif pin and r == a_del:
             self.pins[lv].remove(pin); self._save_pins()
         self.update()
 
-    def _ask_text(self, title, label, text=""):
-        from settingswin import on_top
-        d = QInputDialog(self); d.setWindowTitle(title); d.setLabelText(label); d.setTextValue(text)
-        on_top(d)
-        ok = bool(d.exec())
-        return d.textValue(), ok
+    def _edit_pin_name(self, pin, pos):
+        """Name a pin with a text field right on the map (Enter saves, Esc cancels)."""
+        ed = getattr(self, "_pin_edit", None)
+        if ed is None:
+            ed = self._pin_edit = QLineEdit(self)
+            ed.setStyleSheet("QLineEdit{background:rgba(15,17,19,240);color:#fff;border:1px solid #ffc400;"
+                             "border-radius:8px;padding:5px 9px;font-size:12px}")
+            ed.setPlaceholderText("Pin name, Enter to save")
+            ed.returnPressed.connect(self._finish_pin_name)
+        self._pin_target = pin
+        ed.setText(pin.get("label", ""))
+        x = int(min(max(pos.x() - 110, 8), self.width() - 228)); y = int(min(max(pos.y() + 14, 60), self.height() - 44))
+        ed.setGeometry(x, y, 220, 30); ed.show(); ed.raise_()
+        self._focus_self(); ed.setFocus(); ed.selectAll()
+
+    def _finish_pin_name(self, cancel=False):
+        ed = getattr(self, "_pin_edit", None)
+        if ed is None or not ed.isVisible():
+            return False
+        if not cancel and getattr(self, "_pin_target", None) is not None:
+            self._pin_target["label"] = ed.text().strip(); self._save_pins()
+        ed.hide(); self._pin_target = None; self.update()
+        return True
 
     def mouseMoveEvent(self, e):
         if self.drag is None:
