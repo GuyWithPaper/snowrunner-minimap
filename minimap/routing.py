@@ -1,12 +1,14 @@
 """Route planning over a region, using only ground the player has uncovered (fog of war).
 
 Per region a grid (CELL metres) is built once from the game's own data and cached:
-  road   0..1  weight of road materials in the terrain blend map (gravel_road, asphalt, concrete, dirt road...)
-  mud    0..1  deformable-mud depth (extrude map)
+  road   0..1  roads as the game's own map draws them (grey-blue lines on the baked map); terrain blend
+               map road materials only for regions without a baked map
+  mud    0..1  deformable-mud depth (extrude map): the level's off-road trails and mud fields
   slope        rise/run from the heightmap
   water        water depth in metres (water level map minus terrain), 0 where dry
   block        trees, buildings, cliffs; bridges clear water and count as road
-A route is an A* search on a cost per metre derived from those layers; cells under fog are impassable.
+A route is an A* search on a cost per metre derived from those layers; cells still under fog (grey or
+black on the map) are impassable.
 If the waypoint itself is unexplored (or unreachable), the route goes to the closest explored point.
 """
 import heapq, io, json, math, os, re, struct, time, zipfile
@@ -18,7 +20,7 @@ import maprender as M
 import paths
 
 CELL = 3.0
-VERSION = 1
+VERSION = 2
 ROAD_RE = re.compile(r"(road|asphalt|concrete|tile|pavement|path)")
 
 
@@ -48,26 +50,12 @@ def build_grid(level, log=print):
     gz_, gx_ = np.gradient(hgt, CELL)
     slope = np.hypot(gx_, gz_).astype(np.float32)
 
-    # roads from the material blend map (layers of the level's main material set)
-    road = np.zeros((gh, gw), np.float32)
-    bn = base + "blend_map__cmp.pct"
-    try:
-        import terrain
-        sets = terrain.material_sets(stg)
-        if sets and bn in names:
-            common = Counter(tuple(s) for s in sets).most_common(1)[0][0]
-            bw, bh, _ = M.pct_info(z, bn)
-            pw, ph = (bw + 3) // 4 * 4, (bh + 3) // 4 * 4
-            bl = Image.open(io.BytesIO(M.dds_wrap(b"DX10", M.tail(z, bn, pw * ph), pw, ph, 98))).convert("RGB")
-            bl = bl.crop(terrain.terrain_crop(bw, bh, W, H))
-            # max over the cell keeps narrow roads visible at 3 m
-            big = np.asarray(bl.resize((gw * 3, gh * 3), Image.BILINEAR), np.float32) / 255
-            big = big.reshape(gh, 3, gw, 3, 3).max(axis=(1, 3))
-            for li, (nm, _) in enumerate(common[1:]):
-                if ROAD_RE.search(nm):
-                    road = np.maximum(road, big[..., li])
-    except Exception as e:
-        log(f"  route: road layer unavailable ({e})")
+    baked = M.baked_tiles(stg, W, H) if stg else None
+    road = baked_roads(baked, half_x, half_z, size) if baked is not None else None
+    if road is not None:
+        log(f"  route: roads from the game's map ({(road > 0.5).mean() * 100:.1f}% of cells)")
+    else:
+        road = blend_roads(z, names, stg, base, W, H, size, log)
 
     # mud
     mud = np.zeros((gh, gw), np.float32)
@@ -88,7 +76,6 @@ def build_grid(level, log=print):
             lv = np.where(ok, wl, -1e9).astype(np.float32)
             lvl = np.asarray(Image.fromarray(lv).transform(size, Image.EXTENT, (0, 0, ww - 1, wh - 1), Image.NEAREST), np.float32)
             water = np.clip(lvl - hgt, 0, 50).astype(np.float32)
-            baked = M.baked_tiles(stg, W, H) if stg else None
             if baked is not None:
                 b = baked[..., :3].astype(np.float32)
                 wet = ((b[..., 2] > b[..., 0] + 18) & (b[..., 2] > b[..., 1] + 4)).astype(np.uint8) * 255
@@ -106,6 +93,8 @@ def build_grid(level, log=print):
             for p in arr:
                 tree_pts.append((p[0], p[2]))
                 cx, cz = (p[0] + half_x) / CELL, (p[2] + half_z) / CELL
+                if 0 <= int(cz) < gh and 0 <= int(cx) < gw and road[int(cz), int(cx)] > 0.5:
+                    continue                      # a plant on the road (grass, saplings): drivable
                 r = 0.45
                 bd.ellipse((cx - r, cz - r, cx + r, cz + r), fill=255)
             continue
@@ -124,7 +113,6 @@ def build_grid(level, log=print):
                 (brd if is_bridge else bd).polygon(pts, fill=255)
     # prefab buildings without landmark meshes: the game's own baked footprints (dark occlusion, not trees)
     try:
-        baked = baked if 'baked' in dir() and baked is not None else (M.baked_tiles(stg, W, H) if stg else None)
         if baked is not None:
             a = baked[..., 3].astype(np.float32) / 255
             tm = Image.new("L", (a.shape[1], a.shape[0]), 0); td = ImageDraw.Draw(tm)
@@ -150,6 +138,48 @@ def build_grid(level, log=print):
     log(f"  route grid {gw}x{gh} built in {time.time() - t0:.1f}s (roads {road.mean() * 100:.1f}%, blocked {blk.mean() * 100:.1f}%)")
 
 
+def baked_roads(baked, half_x, half_z, size):
+    """Roads, streets and yards as the game's own map draws them: grey-blue on the sandy terrain colour.
+    Shorelines look similar, so anything right next to water is left out."""
+    from PIL import ImageFilter
+    crop = (0, 0, int(round(2 * half_x / 0.75)), int(round(2 * half_z / 0.75)))
+    c = np.asarray(Image.fromarray(baked[..., :3]).crop(crop), np.float32)
+    R, G, B = c[..., 0], c[..., 1], c[..., 2]
+    lum = 0.3 * R + 0.59 * G + 0.11 * B
+    wet = (B > R + 18) & (B > G + 4) & (lum < 150)
+    near_wet = np.asarray(Image.fromarray(wet.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(9))) > 0
+    road = (R - B < 40) & (B - R < 60) & (lum > 120) & ~near_wet
+    # close small gaps (bridges of shade, faded stretches), then sample at the grid size keeping thin roads
+    im = Image.fromarray(road.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    gw, gh = size
+    big = np.asarray(im.resize((gw * 2, gh * 2), Image.BILINEAR), np.float32) / 255
+    return big.reshape(gh, 2, gw, 2).max(axis=(1, 3)).astype(np.float32)
+
+
+def blend_roads(z, names, stg, base, W, H, size, log=print):
+    """Fallback: road materials painted into the terrain blend map."""
+    gw, gh = size
+    road = np.zeros((gh, gw), np.float32)
+    bn = base + "blend_map__cmp.pct"
+    try:
+        import terrain
+        sets = terrain.material_sets(stg)
+        if sets and bn in names:
+            common = Counter(tuple(s) for s in sets).most_common(1)[0][0]
+            bw, bh, _ = M.pct_info(z, bn)
+            pw, ph = (bw + 3) // 4 * 4, (bh + 3) // 4 * 4
+            bl = Image.open(io.BytesIO(M.dds_wrap(b"DX10", M.tail(z, bn, pw * ph), pw, ph, 98))).convert("RGB")
+            bl = bl.crop(terrain.terrain_crop(bw, bh, W, H))
+            big = np.asarray(bl.resize((gw * 3, gh * 3), Image.BILINEAR), np.float32) / 255
+            big = big.reshape(gh, 3, gw, 3, 3).max(axis=(1, 3))
+            for li, (nm, _) in enumerate(common[1:]):
+                if ROAD_RE.search(nm):
+                    road = np.maximum(road, big[..., li])
+    except Exception as e:
+        log(f"  route: road layer unavailable ({e})")
+    return road
+
+
 class Grid:
     def __init__(self, level):
         d = np.load(grid_path(level))
@@ -170,17 +200,31 @@ class Grid:
 
 
 STYLES = {
-    #            off-road, mud,  slope, water
-    "balanced": (1.6, 3.5, 1.0, 5.0),
-    "roads":    (4.0, 6.0, 1.2, 8.0),
-    "shortest": (0.25, 0.8, 0.5, 2.0),
+    # Roads are cheapest, then the game's off-road trails (its mud tracks); open terrain costs a lot more and
+    # woods more again, so the route only leaves roads and trails for a short, clear shortcut.
+    #            trail, open terrain, slope, water, forest
+    "balanced": (1.2, 8.0, 1.0, 6.0, 6.0),
+    "roads":    (5.0, 16.0, 1.2, 10.0, 10.0),
+    "shortest": (0.5, 1.5, 0.5, 2.5, 2.0),
 }
 
 
+def box_mean(a, r):
+    """Mean over a (2r+1)^2 window (summed-area table, edges clamped)."""
+    p = np.pad(a.astype(np.float64), r + 1, mode="edge")
+    c = p.cumsum(0).cumsum(1)
+    k = 2 * r + 1
+    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+    return (s / (k * k))[: a.shape[0], : a.shape[1]].astype(np.float32)
+
+
 def cost_grid(g, style="balanced"):
-    k_off, k_mud, k_slope, k_w = STYLES.get(style, STYLES["balanced"])
-    c = 1.0 + (1.0 - g.road) * k_off
-    c += g.mud * k_mud * (1.0 - 0.7 * g.road)
+    k_trail, k_off, k_slope, k_w, k_for = STYLES.get(style, STYLES["balanced"])
+    if getattr(g, "forest", None) is None:
+        g.forest = box_mean(g.block, 3)            # share of blocked cells within ~10 m: 0 open field .. 1 woods
+    trail = np.clip((g.mud - 0.12) / 0.25, 0, 1) * (1.0 - g.road)     # trails are the level's mud tracks
+    off = 1.0 - np.maximum(g.road, trail)
+    c = 1.0 + trail * k_trail + off * (k_off + k_for * np.clip(g.forest * 1.6, 0, 1) ** 1.5)
     c *= 1.0 + k_slope * (g.slope / 0.3) ** 2
     c += np.where(g.water > 0.05, k_w * np.minimum(g.water, 1.5), 0)
     blocked = g.block | (g.slope > 0.75) | (g.water > 1.4)
@@ -188,7 +232,8 @@ def cost_grid(g, style="balanced"):
 
 
 def fog_mask(g, fog):
-    """True where the player has uncovered the map (fog grid value >= 128)."""
+    """True where the player has uncovered the map. The fog file holds 255 for uncovered ground, 128 for the grey
+    still-fogged band and 0 for black; only 255 counts."""
     if fog is None:
         return np.ones((g.h, g.w), bool)
     fg, (ox, oz, sx, sz) = fog
@@ -196,7 +241,7 @@ def fog_mask(g, fog):
     js = np.arange(g.w); is_ = np.arange(g.h)
     xs = -g.half_x + (js + 0.5) * g.cell; zs = -g.half_z + (is_ + 0.5) * g.cell
     u = np.clip(((xs - ox) / sx * fw).astype(int), 0, fw - 1); v = np.clip(((zs - oz) / sz * fh).astype(int), 0, fh - 1)
-    return fg[v[:, None], u[None, :]] >= 128
+    return fg[v[:, None], u[None, :]] >= 192
 
 
 def find_route(g, cost, open_mask, start, goal, max_expand=900_000):
