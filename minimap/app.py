@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QSystemTrayIcon, QMenu, QM
                                QPushButton, QHBoxLayout, QInputDialog, QColorDialog, QLineEdit, QListWidget,
                                QListWidgetItem, QGraphicsOpacityEffect)
 
-import reader as rd, levels, maprender, savedata, updater, icons, routing
+import reader as rd, levels, maprender, savedata, updater, icons, routing, gamewp
 from settingswin import SettingsWindow, STYLE, dark_title_bar
 from version import VERSION
 
@@ -214,6 +214,10 @@ class Overlay(QWidget):
         self.pan = None            # big map: world point at view centre when the user pans
         self.big_zoom = self.s["big_zoom"]
         self.waypoint = {}         # level -> (x, z)
+        self.game_wps = {}         # level -> [(x, z)] waypoints read from the game's map, in visit order
+        self._wp_src = {}          # level -> "game" | "me"
+        self.gw = None             # gamewp.Watcher while the game runs
+        self._gw_ver = -1
         self.pins = self._load_pins()   # level -> [{x, z, label, color}]
         self._progress = (None, set())  # (save mtime, completed ids)
         self._vehicles = {}             # level -> (sts mtime, [(name, tag, x, z)])
@@ -387,7 +391,9 @@ class Overlay(QWidget):
         r = self.route
         fog_p = os.path.join(self.save_dir or "", f"fog_{lv}.cfg")
         fog_t = os.path.getmtime(fog_p) if os.path.exists(fog_p) else 0
-        need = (r is None or r.get("level") != lv or r.get("goal") != wp or r.get("style") != self.s.get("route_style")
+        vias = self.game_wps.get(lv, [])[:-1] if self._wp_src.get(lv) == "game" else []
+        need = (r is None or r.get("level") != lv or r.get("goal") != wp or r.get("vias", []) != vias
+                or r.get("style") != self.s.get("route_style")
                 or (r.get("fog") != fog_t and now - r["t"] > 5))
         if not need and r and r.get("points"):
             # off the planned line? re-plan from here
@@ -405,8 +411,20 @@ class Overlay(QWidget):
                     self.route = {"level": lv, "goal": wp, "points": [], "failed": True, "t": time.time(), "fog": fog_t, "style": style}
                     return
                 fog = levels.fog(lv, save_dir)
-                res = routing.find_route(g, routing.cost_grid(g, style), routing.fog_mask(g, fog), start, wp)
-                self.route = dict(res or {"points": []}, level=lv, goal=wp, t=time.time(), fog=fog_t, style=style)
+                cost, mask = routing.cost_grid(g, style), routing.fog_mask(g, fog)
+                # one leg per waypoint, in the order the game's route visits them
+                pts, total, cur, reached, used = [], 0.0, start, True, wp
+                for goal in vias + [wp]:
+                    leg = routing.find_route(g, cost, mask, cur, goal)
+                    if not leg or not leg.get("points"):
+                        reached = False; used = pts[-1] if pts else start; break
+                    pts += leg["points"] if not pts else leg["points"][1:]
+                    total += leg.get("length", 0.0)
+                    if not leg.get("reached"):
+                        reached = False; used = leg.get("goal_used") or leg["points"][-1]; break
+                    cur = goal
+                res = {"points": pts, "length": total, "reached": reached, "goal_used": used} if pts else None
+                self.route = dict(res or {"points": []}, level=lv, goal=wp, vias=vias, t=time.time(), fog=fog_t, style=style)
             except Exception:
                 log("route failed", traceback.format_exc())
             finally:
@@ -1086,9 +1104,9 @@ class Overlay(QWidget):
         if r is None:
             return
         if r == a_wp:
-            self.waypoint[lv] = (wx, wz)
+            self.waypoint[lv] = (wx, wz); self._wp_src[lv] = "me"; self.game_wps.pop(lv, None)
         elif r == a_clr:
-            self.waypoint.pop(lv, None)
+            self.waypoint.pop(lv, None); self._wp_src.pop(lv, None); self.game_wps.pop(lv, None)
         elif r == a_pin:
             newp = {"x": wx, "z": wz, "label": "", "color": "#5AC8FF"}
             self.pins.setdefault(lv, []).append(newp); self._save_pins()
@@ -1172,6 +1190,33 @@ class Overlay(QWidget):
             self.refresh_visibility(); self.update()
         if self.save_dir is None:
             self.save_dir = savedata.save_dir()
+        if self.reader.P and self.gw is None and self.s.get("game_waypoints", True):
+            self.gw = gamewp.Watcher(self.reader.P.pid, log=log); self._gw_ver = -1
+        elif self.gw is not None and not self.s.get("game_waypoints", True):
+            self._stop_game_wps()
+
+    def _stop_game_wps(self):
+        if self.gw is not None:
+            self.gw.stop(); self.gw = None
+        for lv in [k for k, v in self._wp_src.items() if v == "game"]:
+            self.waypoint.pop(lv, None); self.game_wps.pop(lv, None); self._wp_src.pop(lv, None)
+
+    def sync_game_wps(self, lv, st):
+        """Take over the waypoints placed on SnowRunner's own map (when they change)."""
+        gw = self.gw
+        if gw is None or not gw.ready or gw.version == self._gw_ver:
+            return
+        self._gw_ver = gw.version
+        m = self.store.meta.get(lv)
+        pts = [q for q in gw.points if m is None or (abs(q[0]) <= m["half_x"] + 5 and abs(q[1]) <= m["half_z"] + 5)]
+        if pts:
+            order = gamewp.order_from((st.x, st.z), pts)
+            self.game_wps[lv] = order; self.waypoint[lv] = order[-1]; self._wp_src[lv] = "game"
+            log("game waypoints", order)
+        elif self._wp_src.get(lv) == "game":
+            self.waypoint.pop(lv, None); self.game_wps.pop(lv, None); self._wp_src.pop(lv, None)
+            log("game waypoints cleared")
+        self.update()
 
     def tick(self):
         if not self.reader.P:
@@ -1180,6 +1225,7 @@ class Overlay(QWidget):
             st = self.reader.read()
         except ConnectionError:
             self.state = None; self.level = None; self.game_running = False
+            self._stop_game_wps()
             if self.pending_update:
                 QTimer.singleShot(3000, self.apply_update)
             if self.detector: self.detector.reset()
@@ -1223,6 +1269,7 @@ class Overlay(QWidget):
                 log("region", lv, levels.display_name(lv))
                 self.store.ensure(lv)
         if lv:
+            self.sync_game_wps(lv, st)
             self.maybe_route(lv, st)
             tr = self.trails.setdefault(lv, [])
             if jumped and tr and tr[-1] is not None:
@@ -1303,8 +1350,7 @@ class Overlay(QWidget):
                 pts = [QPointF(st.x, st.z)] if st is not None else []
                 rp = rt["points"]
                 if st is not None:          # start from the nearest point on the route ahead of the truck
-                    k = min(range(0, len(rp)), key=lambda i: (rp[i][0] - st.x) ** 2 + (rp[i][1] - st.z) ** 2)
-                    rp = rp[k:]
+                    rp = rp[self._route_index(rt, st):]
                 pts += [QPointF(x, z) for x, z in rp]
                 poly = QPolygonF(pts)
                 col = QColor(self.s.get("route_color", "#4FC3FF"))
@@ -1322,6 +1368,9 @@ class Overlay(QWidget):
             if self.s["markers"]:
                 self.draw_markers(p, lv, t, clip, zoom)
             if wp:
+                if self._wp_src.get(lv) == "game":
+                    for v in self.game_wps.get(lv, [])[:-1]:
+                        self.draw_waypoint(p, t, clip, v, cx, cy, D, small=True)
                 self.draw_waypoint(p, t, clip, wp, cx, cy, D)
             if self.big and self._hilite and time.time() - self._hilite[2] < 6:
                 hp = t.map(QPointF(self._hilite[0], self._hilite[1]))
@@ -1448,14 +1497,27 @@ class Overlay(QWidget):
             p.setPen(QColor(255, 255, 255)); p.setFont(self._font(8, QFont.Bold))
             p.drawText(QRectF(x - 9, y - 9, 18, 18), Qt.AlignCenter, "N")
 
-    def draw_waypoint(self, p, t, clip, wp, cx, cy, D):
+    def _route_index(self, rt, st):
+        """Nearest route point to the truck, searched just around the last one (a route through several
+        waypoints can pass the same spot twice)."""
+        rp = rt["points"]
+        k0 = rt.get("_k", 0)
+        lo, hi = max(0, k0 - 40), min(len(rp), k0 + 600)
+        k = min(range(lo, hi), key=lambda i: (rp[i][0] - st.x) ** 2 + (rp[i][1] - st.z) ** 2) if hi > lo else 0
+        rt["_k"] = k
+        return k
+
+    def draw_waypoint(self, p, t, clip, wp, cx, cy, D, small=False):
         pt = t.map(QPointF(*wp))
         if clip.contains(pt):
+            if small:                      # a waypoint the route passes on the way
+                p.setPen(QPen(QColor(0, 0, 0, 200), 2.5)); p.setBrush(QColor(90, 200, 255))
+                p.drawEllipse(pt, 5.5, 5.5); return
             p.setPen(QPen(QColor(0, 0, 0, 200), 3)); p.setBrush(QColor(90, 200, 255))
             pin = QPainterPath(); x, y = pt.x(), pt.y()
             pin.moveTo(x, y); pin.cubicTo(x - 12, y - 14, x - 8, y - 26, x, y - 26); pin.cubicTo(x + 8, y - 26, x + 12, y - 14, x, y)
             p.drawPath(pin); p.setBrush(QColor(20, 30, 40)); p.drawEllipse(QPointF(x, y - 17), 3.5, 3.5)
-        elif not self.big:
+        elif not self.big and not small:
             a = math.atan2(pt.x() - cx, -(pt.y() - cy))
             rr = D / 2 - 14
             x, y = cx + math.sin(a) * rr, cy - math.cos(a) * rr
@@ -1474,7 +1536,7 @@ class Overlay(QWidget):
             rt = self.route if (self.route and self.route.get("level") == lv and self.route.get("goal") == wp) else None
             if rt and rt.get("points"):
                 rp = rt["points"]
-                k = min(range(len(rp)), key=lambda i: (rp[i][0] - st.x) ** 2 + (rp[i][1] - st.z) ** 2)
+                k = self._route_index(rt, st)
                 left = math.hypot(rp[k][0] - st.x, rp[k][1] - st.z) + sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(rp[k:], rp[k + 1:]))
                 extra.append(("Route " if rt.get("reached") else "Route to fog edge ") + self.fmt_dist(left))
             else:

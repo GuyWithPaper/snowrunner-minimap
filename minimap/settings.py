@@ -60,6 +60,7 @@ DEFAULTS = {
     "route": True,
     "route_style": "balanced",      # balanced | roads | shortest
     "route_color": "#4FC3FF",
+    "game_waypoints": True,          # follow the waypoints set on the game's own map
     "trail": True,
     "trail_color": "#FFD23C",
     "trail_length": 4000,

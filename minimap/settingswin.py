@@ -384,7 +384,9 @@ class SettingsWindow(QDialog):
                                                      ("roads", "Stick to roads, avoid mud and water"),
                                                      ("shortest", "Shortest (only avoid what's impassable)")])
         self.color(f, "Route colour", "route_color")
-        self.hint(f, "Set a waypoint by right-clicking the big map. The route avoids trees, buildings, cliffs, deep water and "
+        self.check(f, "Use the waypoints I set on SnowRunner's map", "game_waypoints")
+        self.hint(f, "Waypoints you set on SnowRunner's map show up here once you close the map (with several, the route "
+                     "visits each in turn). You can also right-click the big map. The route avoids trees, buildings, cliffs, deep water and "
                      "anything still under fog of war, and re-plans if you leave it.")
         f = self.group(v, "Trail")
         self.check(f, "Draw the path you've driven", "trail")
