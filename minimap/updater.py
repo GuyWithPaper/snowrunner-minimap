@@ -41,19 +41,24 @@ def check(log=print):
     return None
 
 
-def download(url, tag, log=print):
+def download(url, tag, log=print, progress=None):
     """Download the setup for `tag` (kept between runs, so a pending update survives a restart)."""
     dst = os.path.join(tempfile.gettempdir(), f"MapRunner-Setup-{tag}.exe")
     if os.path.exists(dst) and os.path.getsize(dst) > 1_000_000:
         return dst
     tmp = dst + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
-    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+    with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0); got = 0; last = -1
         while True:
-            b = r.read(1 << 16)
+            b = r.read(1 << 18)
             if not b:
                 break
-            f.write(b)
+            f.write(b); got += len(b)
+            if progress and total:
+                pct = int(got * 100 / total)
+                if pct != last:
+                    last = pct; progress(pct)
     if os.path.getsize(tmp) < 1_000_000:
         os.remove(tmp); raise IOError("download too small")
     os.replace(tmp, dst)

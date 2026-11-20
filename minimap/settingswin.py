@@ -442,9 +442,16 @@ class SettingsWindow(QDialog):
         sp = QSpinBox(); sp.setRange(1, 48); sp.setValue(int(self.s["update_hours"])); sp.setSuffix(" h")
         sp.valueChanged.connect(lambda x: self.set("update_hours", x)); f.addRow("Check every", sp)
         row = QWidget(); h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0)
-        b = QPushButton("Check now"); b.setObjectName("primary"); b.clicked.connect(lambda: self.action.emit("check_updates"))
+        b = self.upd_btn = QPushButton("Check now"); b.setObjectName("primary"); b.clicked.connect(lambda: self.action.emit("check_updates"))
         b2 = QPushButton("Release notes"); b2.clicked.connect(lambda: webbrowser.open(f"https://github.com/{REPO}/releases"))
         h.addWidget(b); h.addWidget(b2); h.addStretch(1); f.addRow(row)
+        self.upd_status = QLabel(""); self.upd_status.setWordWrap(True); self.upd_status.setStyleSheet("color:#cfd3d6")
+        self.upd_status.hide(); f.addRow(self.upd_status)
+
+    def set_update_status(self, text, busy=False):
+        """Live result of "Check now", shown right under the button."""
+        self.upd_status.setText(text); self.upd_status.setVisible(bool(text))
+        self.upd_btn.setEnabled(not busy); self.upd_btn.setText("Checking…" if busy else "Check now")
 
     def p_advanced(self, v):
         f = self.group(v, "Game files")

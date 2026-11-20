@@ -185,10 +185,12 @@ class Welcome(QDialog):
 class Overlay(QWidget):
     sig_update = Signal(str, str, bool)
     sig_notify = Signal(str)
+    sig_upd_status = Signal(str, bool)
 
     def __init__(self):
         super().__init__()
         self.pending_update = None
+        self._upd_manual = False
         self.view = "map"            # big-mode content: "map" | "settings"
         self.route = None            # {"level","goal","points","length","reached","t","fog"}
         self._route_busy = False
@@ -199,6 +201,7 @@ class Overlay(QWidget):
         self._anims = []
         self.sig_update.connect(self._on_update_ready)
         self.sig_notify.connect(lambda m: self.notify(m, force=True))
+        self.sig_upd_status.connect(self._upd_status)
         self.s = S.load()
         self.setWindowTitle("Map Runner")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -653,30 +656,51 @@ class Overlay(QWidget):
         """Check and download in the background; install only when SnowRunner isn't running (or on request)."""
         if not manual and not self.s["auto_update"]:
             return
+        if manual:
+            self._upd_manual = True
+            if self.pending_update:                  # already downloaded by the background check
+                self.apply_update(); return
         if getattr(self, "_upd_busy", False):
+            # a background check is already running: it reports back to this click when it finishes
+            if manual:
+                self._upd_status("Checking for updates…", True)
             return
         self._upd_busy = True
+        if manual:
+            self._upd_status("Checking for updates…", True)
+        say = lambda text, busy=False: self.sig_upd_status.emit(text, busy) if self._upd_manual else None
         def run():
             try:
                 if not updater.can_self_update():
-                    if manual: self.sig_notify.emit("Running from source; updates come from git.")
-                    return
-                r = updater.check(log=log)
-                if not r:
-                    if manual: self.sig_notify.emit(f"You're on the latest version ({VERSION}).")
-                    return
-                tag, url = r
-                path = updater.download(url, tag, log=log)
-                self.sig_update.emit(tag, path, bool(manual))
+                    say("Running from source; updates come from git."); return
+                tag, asset = updater.latest()            # raises if GitHub can't be reached
+                if not (asset and updater._ver(tag) > updater._ver(VERSION)):
+                    say(f"You're on the latest version ({VERSION})."); return
+                url = asset["browser_download_url"]
+                say(f"Downloading {tag}…", True)
+                path = updater.download(url, tag, log=log, progress=lambda pct: say(f"Downloading {tag}… {pct}%", True))
+                self.sig_update.emit(tag, path, bool(self._upd_manual))
             except Exception as e:
                 log("update failed", e)
-                if manual: self.sig_notify.emit("The update couldn't be downloaded. It will retry later.")
+                say("Couldn't reach GitHub to check for updates. Check your connection and try again.")
             finally:
                 self._upd_busy = False
         threading.Thread(target=run, daemon=True).start()
 
+    def _upd_status(self, text, busy=False):
+        """Show the result of a manual check in the settings panel (tray pop-ups get delayed or hidden by Windows)."""
+        if not busy:
+            self._upd_manual = False
+        sw = self.settings_win
+        if sw is not None and sw.isVisible() and hasattr(sw, "set_update_status"):
+            sw.set_update_status(text, busy)
+        elif not busy:
+            self.notify(text, force=True)
+
     def _on_update_ready(self, tag, path, manual):
         self.pending_update = (tag, path)
+        if manual:
+            self._upd_status(f"Installing {tag}. Map Runner restarts in a few seconds.", True)
         if manual or not self.game_running:
             self.apply_update()
         else:
