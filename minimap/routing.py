@@ -20,7 +20,7 @@ import maprender as M
 import paths
 
 CELL = 3.0
-VERSION = 2
+VERSION = 3
 ROAD_RE = re.compile(r"(road|asphalt|concrete|tile|pavement|path)")
 
 
@@ -105,12 +105,20 @@ def build_grid(level, log=print):
         is_bridge = "bridge" in nm.lower()
         if not is_bridge and (ext[1] < 1.2 or ext[0] * ext[2] < 4 or M.map_clutter(nm, ext)):
             continue
+        if not is_bridge:
+            # only what stands on the ground blocks a truck (walls, trunks, rocks), not roofs or canopies
+            # seen from above: keep triangles reaching down to within 1.5 m of the model's base
+            y0 = tris[..., 1].min()
+            tris = tris[tris[..., 1].min(axis=1) < y0 + 1.5]
+            if not len(tris):
+                continue
         for p in arr:
             R = M.quat_matrix(p[4:8]) if len(p) >= 8 else np.eye(3, dtype=np.float32)
             w = (tris.reshape(-1, 3) @ R.T * p[3] + p[:3]).reshape(-1, 3, 3)
             for tri in w:
                 pts = [((x + half_x) / CELL, (zz + half_z) / CELL) for x, _, zz in tri]
                 (brd if is_bridge else bd).polygon(pts, fill=255)
+    log(f"  route: trees and meshes block {(np.asarray(block) > 0).mean() * 100:.1f}%")
     # prefab buildings without landmark meshes: the game's own baked footprints (dark occlusion, not trees)
     try:
         if baked is not None:
@@ -122,6 +130,7 @@ def build_grid(level, log=print):
             fp = (a < 0.42) & ~(np.asarray(tm) > 0)
             fpi = Image.fromarray(fp.astype(np.uint8) * 255).crop((0, 0, int(round(2 * half_x / 0.75)), int(round(2 * half_z / 0.75))))
             fpg = np.asarray(fpi.resize(size, Image.BOX)) > 140
+            log(f"  route: footprints block {fpg.mean() * 100:.1f}%")
             block = Image.fromarray(np.maximum(np.asarray(block), fpg.astype(np.uint8) * 255))
     except Exception as e:
         log(f"  route: footprints unavailable ({e})")
@@ -231,11 +240,27 @@ def cost_grid(g, style="balanced"):
     return np.where(blocked, np.inf, c).astype(np.float32)
 
 
-def fog_mask(g, fog):
+def fog_mask(g, fog, driven=None, radius=40.0):
     """True where the player has uncovered the map. The fog file holds 255 for uncovered ground, 128 for the grey
     still-fogged band and 0 for black; only 255 counts."""
     if fog is None:
         return np.ones((g.h, g.w), bool)
+    m = _fog_cells(g, fog)
+    if driven:
+        # the game writes its fog file only when it saves: ground you've driven since then is uncovered too
+        im = Image.new("L", (g.w, g.h), 0); d = ImageDraw.Draw(im)
+        r = radius / g.cell
+        for line in driven:
+            pts = [((x + g.half_x) / g.cell, (z + g.half_z) / g.cell) for x, z in line]
+            if len(pts) > 1:
+                d.line(pts, fill=255, width=int(2 * r))
+            for cx, cz in pts[:: max(1, len(pts) // 400)] + pts[-1:]:
+                d.ellipse((cx - r, cz - r, cx + r, cz + r), fill=255)
+        m |= np.asarray(im) > 0
+    return m
+
+
+def _fog_cells(g, fog):
     fg, (ox, oz, sx, sz) = fog
     fh, fw = fg.shape
     js = np.arange(g.w); is_ = np.arange(g.h)
@@ -250,9 +275,10 @@ def find_route(g, cost, open_mask, start, goal, max_expand=900_000):
     cst = np.where(open_mask, cost, np.inf)
     si, sj = g.cell_of(*start)
     gi, gj = g.cell_of(*goal)
-    # the start cell is always allowed (you're standing there)
-    if not np.isfinite(cst[si, sj]):
-        cst[si, sj] = 3.0
+    # the truck can always drive out of where it stands (parked between trees, at a fog edge...)
+    r = 6
+    win = cst[max(si - r, 0):si + r + 1, max(sj - r, 0):sj + r + 1]
+    win[~np.isfinite(win)] = 6.0
     reached_goal_cell = bool(np.isfinite(cst[gi, gj]))
     flat = cst.ravel().tolist()
     INF = float("inf")

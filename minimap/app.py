@@ -404,6 +404,14 @@ class Overlay(QWidget):
             return
         self._route_busy = True
         start = (st.x, st.z); style = self.s.get("route_style", "balanced"); save_dir = self.save_dir
+        driven, seg = [], []
+        for pt in list(self.trails.get(lv, [])) + [None]:
+            if pt is None:
+                if seg: driven.append(seg)
+                seg = []
+            else:
+                seg.append(pt)
+        driven.append([start])
         def work():
             try:
                 g = self._route_grid(lv)
@@ -411,7 +419,7 @@ class Overlay(QWidget):
                     self.route = {"level": lv, "goal": wp, "points": [], "failed": True, "t": time.time(), "fog": fog_t, "style": style}
                     return
                 fog = levels.fog(lv, save_dir)
-                cost, mask = routing.cost_grid(g, style), routing.fog_mask(g, fog)
+                cost, mask = routing.cost_grid(g, style), routing.fog_mask(g, fog, driven)
                 # one leg per waypoint, in the order the game's route visits them
                 pts, total, cur, reached, used = [], 0.0, start, True, wp
                 for goal in vias + [wp]:
@@ -425,6 +433,8 @@ class Overlay(QWidget):
                     cur = goal
                 res = {"points": pts, "length": total, "reached": reached, "goal_used": used} if pts else None
                 self.route = dict(res or {"points": []}, level=lv, goal=wp, vias=vias, t=time.time(), fog=fog_t, style=style)
+                if not res:
+                    log("route: no way out from", tuple(round(c) for c in start), "to", tuple(round(c) for c in wp))
             except Exception:
                 log("route failed", traceback.format_exc())
             finally:
