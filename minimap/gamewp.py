@@ -4,12 +4,12 @@ Every map icon the game can show is a small record in its own heap block:
 
     +0   x, y, z        map units (world metres = 150 x map units)
     +12  flags word
-    +16  u32            (varies)
+    +16  u32            0x00010000 on the waypoints you placed (the route points), else 0
     +20  15.0, -1, -1, -1, -1
-    +96  u32 state      2 = shown, 4 = hidden
+    +96  u32 state      2 = shown on the map screen, 4 = hidden
 
-While you drive (map closed) the only records shown are your waypoints, which the game draws as
-markers in the world. With the map open every icon is shown, so the last list is kept until it closes.
+With the map open nearly every icon is shown, and the game may rebuild its records, so the list
+only changes once the map is closed and it has stayed the same for a moment.
 
 Finding the records needs one pass over the game's small heap blocks (a few seconds, background
 thread). After that only the known records and newly allocated blocks are read, twice a second.
@@ -24,7 +24,9 @@ SCALE = 150.0
 TAIL = struct.pack("<5f", 15.0, -1.0, -1.0, -1.0, -1.0)
 SMALL = 0x40000                 # records live in ~0.1 MB blocks
 SHOWN = 2
-MAX_HUD = 8                     # more shown than this = the map screen is open
+WAYPOINT = 0x00010000
+MAX_HUD = 8                     # more icons shown than this = the map screen is open
+SETTLE = 1.0                    # seconds a new list must hold before it's used
 
 
 def _valid(b):
@@ -74,6 +76,7 @@ class Watcher:
         except Exception as e:
             self.log("game waypoints: can't open process", e); return
         recs, known, last_enum = set(), set(), 0.0
+        cand, cand_t = None, 0.0
         try:
             while not self._stop:
                 now = time.time()
@@ -91,25 +94,30 @@ class Watcher:
                         self.log(f"game waypoints: {len(recs)} map records found in {time.time() - t0:.1f}s")
                         self.ready = True
                     last_enum = time.time()
-                shown, dead = [], []
+                n_shown, wps, dead = 0, [], []
                 for a in recs:
                     b = P.read(a, 100)
                     v = _valid(b) if b else None
                     if v is None:
                         dead.append(a); continue
-                    if struct.unpack_from("<I", b, 96)[0] == SHOWN and (v[0] or v[2]):     # (0, 0) = unused record
-                        shown.append((round(v[0] * SCALE, 2), round(v[2] * SCALE, 2)))
+                    if not (v[0] or v[2]):                      # (0, 0) = unused record
+                        continue
+                    n_shown += struct.unpack_from("<I", b, 96)[0] == SHOWN
+                    if struct.unpack_from("<I", b, 16)[0] == WAYPOINT:
+                        wps.append((round(v[0] * SCALE, 2), round(v[2] * SCALE, 2)))
                 for a in dead:
                     recs.discard(a)
-                self.map_open = len(shown) > MAX_HUD
-                if not self.map_open:
-                    # the same waypoint can be drawn by two records: merge points within 1 m
-                    pts = []
-                    for p in sorted(shown):
-                        if all(math.hypot(p[0] - q[0], p[1] - q[1]) > 1.0 for q in pts):
-                            pts.append(p)
-                    if pts != self.points:
-                        self.points = pts; self.version += 1
+                now = time.time()
+                self.map_open = n_shown > MAX_HUD
+                # the same waypoint can be drawn by two records: merge points within 1 m
+                pts = []
+                for p in sorted(wps):
+                    if all(math.hypot(p[0] - q[0], p[1] - q[1]) > 1.0 for q in pts):
+                        pts.append(p)
+                if self.map_open or pts != cand:
+                    cand, cand_t = (None if self.map_open else pts), now
+                elif now - cand_t >= SETTLE and pts != self.points:
+                    self.points = pts; self.version += 1
                 time.sleep(0.5)
         except Exception as e:
             if not self._stop:
