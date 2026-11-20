@@ -1166,8 +1166,12 @@ class Overlay(QWidget):
             if self.state is not None:
                 self.status = "Not driving (garage or menu)"
             self.state = None; self.refresh_visibility(); self.update(); return
+        # a jump no truck can drive between two reads (~33 ms apart) = recover, garage, switched truck
+        jumped = self.state is not None and math.hypot(st.x - self.state.x, st.z - self.state.z) > 25
         if self.state is not None and math.hypot(st.x - self.state.x, st.z - self.state.z) > 60 and self.detector:
             self.detector.samples = []               # switched truck or region
+        if jumped:
+            self._last = st; self.speed = 0.0
         if self._last:
             dt = st.t - self._last.t
             if dt > 0.2:
@@ -1197,10 +1201,15 @@ class Overlay(QWidget):
         if lv:
             self.maybe_route(lv, st)
             tr = self.trails.setdefault(lv, [])
-            if not tr or math.hypot(st.x - tr[-1][0], st.z - tr[-1][1]) > 3:
+            if jumped and tr and tr[-1] is not None:
+                tr.append(None)                      # recovered / teleported: start a new trail piece
+            last = tr[-1] if tr else None
+            if last is None or math.hypot(st.x - last[0], st.z - last[1]) > 3:
                 tr.append((st.x, st.z))
                 if len(tr) > self.s["trail_length"]:
                     del tr[: len(tr) - int(self.s["trail_length"])]
+                while tr and tr[0] is None:
+                    tr.pop(0)
         if self.detector:
             self.status = "" if lv else "Finding which region you're in…"
         self.update()
@@ -1253,7 +1262,17 @@ class Overlay(QWidget):
             if self.s["trail"] and len(tr) > 1:
                 pen = QPen(QColor(self.s["trail_color"])); pen.setWidthF(2.4 / zoom)
                 p.setPen(pen); p.setBrush(Qt.NoBrush)
-                p.drawPolyline(QPolygonF([QPointF(a, b) for a, b in tr]))
+                seg = []; prev = None
+                for pt in tr + [None]:
+                    # break at recover markers, and at any gap no truck could drive between two samples
+                    if pt is None or (prev is not None and math.hypot(pt[0] - prev[0], pt[1] - prev[1]) > 40):
+                        if len(seg) > 1:
+                            p.drawPolyline(QPolygonF(seg))
+                        seg = [QPointF(*pt)] if pt is not None else []
+                        prev = pt
+                        continue
+                    prev = pt
+                    seg.append(QPointF(*pt))
             wp = self.waypoint.get(lv)
             rt = self.route if (self.route and self.route.get("level") == lv and self.route.get("goal") == wp) else None
             if wp and rt and rt.get("points"):
@@ -1459,9 +1478,9 @@ class Overlay(QWidget):
             p.setFont(self._font(15, QFont.Bold)); title = name or "Map Runner"
             tw = p.fontMetrics().horizontalAdvance(title)
             sub = "   ·   ".join(extra)
-            prog = self.progress_summary(lv) if lv else ""
-            p.setFont(self._font(9)); sw = max(p.fontMetrics().horizontalAdvance(sub), p.fontMetrics().horizontalAdvance(prog))
-            card = QRectF(16, 14, max(tw, sw) + 34, 34 + (18 if sub else 0) + (18 if prog else 0))
+            prog_txt = self.progress_summary(lv) if lv else ""
+            p.setFont(self._font(9)); sw = max(p.fontMetrics().horizontalAdvance(sub), p.fontMetrics().horizontalAdvance(prog_txt))
+            card = QRectF(16, 14, max(tw, sw) + 34, 34 + (18 if sub else 0) + (18 if prog_txt else 0))
             self._pill(p, card, radius=12, alpha=225)
             p.setPen(QColor(self.s["accent"])); p.setBrush(QColor(self.s["accent"])); p.drawRoundedRect(QRectF(16, 24, 3.5, card.height() - 20), 2, 2)
             p.setFont(self._font(15, QFont.Bold)); p.setPen(QColor(255, 255, 255))
@@ -1470,8 +1489,8 @@ class Overlay(QWidget):
             p.setFont(self._font(9))
             if sub:
                 p.setPen(QColor(self.s["arrow_color"])); p.drawText(QRectF(30, y, sw + 10, 18), Qt.AlignVCenter | Qt.AlignLeft, sub); y += 18
-            if prog:
-                p.setPen(QColor(200, 200, 195)); p.drawText(QRectF(30, y, sw + 10, 18), Qt.AlignVCenter | Qt.AlignLeft, prog)
+            if prog_txt:
+                p.setPen(QColor(200, 200, 195)); p.drawText(QRectF(30, y, sw + 10, 18), Qt.AlignVCenter | Qt.AlignLeft, prog_txt)
             # hint bar
             hint = f"Drag to pan   ·   Scroll to zoom   ·   Double-click to recentre   ·   Right-click for waypoint and pins   ·   {hk.get('big')} / Esc to close"
             p.setFont(self._font(8, QFont.Normal)); hw = p.fontMetrics().horizontalAdvance(hint)
